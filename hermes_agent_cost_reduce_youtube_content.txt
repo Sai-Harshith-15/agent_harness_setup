@@ -1,0 +1,88 @@
+The Origin of the Cost Problem [00:00:00 - 00:01:10]
+The initial setup: AI Labs built workflows on Hermes using GPT models via an OpenAI subscription [00:04].
+
+The limit problem: Team-wide usage caused them to hit OpenAI usage limits, halting work [00:15].
+
+The switch to Open Router: Switching fixed the limit issue but exposed the true cost because Open Router charges per token [00:20].
+
+The realization: Most costs weren't from active use, but from incorrectly configured tasks burning tokens in the background [00:36].
+
+What Actually Consumes Tokens [00:01:11 - 00:03:45]
+Token Definition: Tokens are the building blocks of words the model reads (input) and writes (output) [01:17].
+
+The Context Payload: Input isn't just your prompt. It includes:
+
+The system prompt [01:22].
+
+The entire conversation history [01:22].
+
+Skill Headers: Names and descriptions of skills [01:33]. Hermes comes with 90 pre-installed skills, and every new workflow you build becomes a new skill [01:43].
+
+MCP tools setup [01:38].
+
+Memory and user files [01:38].
+
+Background Scanning: Hermes constantly scans conversations to build new skills, which burns tokens [01:54].
+
+Self-Evolving Memory: It constantly reads conversations to extract details about you and updates its memory to tailor future answers [02:00].
+
+24/7 Hosting: Because Hermes runs continuously on a local server or VPS (unlike Claude Code, which runs once), background tasks accumulate cost [02:24].
+
+Goals: Running goals on Hermes also costs money [02:59].
+
+How to Track Costs [00:03:04 - 00:03:45]
+Token Database: Hermes stores token usage data in a database in the root folder [03:09]. You can ask the agent to parse this for a detailed breakdown of sessions, tokens, and cost [03:14].
+
+Insights Command: Gives a 30-day cost breakdown, showing what tools/skills are used most, activity patterns, and longest sessions [03:35].
+
+Settings to Adjust: Models & Routing [00:03:46 - 00:06:09]
+Native Subscriptions: You can run Hermes through a Codec subscription at no extra per-token cost [03:56]. Anthropic and Gemini subscriptions are listed in Hermes but cannot be used this way (it breaks their policy); you must use their APIs [04:13].
+
+Open Router & Parto: If using Open Router, use the Parto router. It analyzes the task and routes it to the most efficient of 13 models based on difficulty [04:36].
+
+Auxiliary Tasks (config.yaml): Background jobs (reading images, searching skills, loading MCP tools, writing profile descriptions) are set to auto by default, using your expensive main model. Point these tasks to a cheaper model [04:53].
+
+Sub-Agents: Hermes spawns sub-agents with their own context windows. Assign a cheaper model to sub-agents to save money every time one spins up [05:28].
+
+Effort Level: This dictates how much the model "thinks." Maxing it out burns more tokens. Switch thinking off completely for simple tasks [05:51].
+
+(00:06:10 - 00:07:01 is an ad read for Luma AI).
+
+Settings to Adjust: Context Window Management [00:07:02 - 00:09:59]
+Compress Often: Compressing turns conversation history into a lean summary [07:24].
+
+Compression Threshold: Set lower than the default 50% so the window compresses sooner, sending fewer messages per turn [07:35].
+
+Target Ratio: This is the percentage of old, uncompressed tokens left after compression. Set it lower so less old conversation carries over [07:58].
+
+Tool Output Limits: Lower the limit on how much of a tool's output enters the context window (they originally had this high on OpenAI, but lowered it on Open Router to save costs) [08:09].
+
+Ephemeral Prompts: For one-time instructions, use an ephemeral system prompt so it doesn't permanently live in the Hermes context files [08:31].
+
+Organize Local Data: If using a "second brain," organize the data properly so the agent loads it bit-by-bit rather than pulling in unnecessary tokens [08:43].
+
+Trim Memory/Agent Files: Keep these source files small, as they sit in the context window constantly [09:00].
+
+Auto-Memory Toggle: You can switch auto-memory off to stop files from landing in context. (AI Labs keeps it on for team context, but notes it saves money if disabled) [09:11].
+
+The Undo Command: If Hermes makes a mistake, don't reprompt. Use undo to step back one message, then provide a fresh prompt. This stops the context window from bloating with errors [09:39].
+
+Settings to Adjust: Tools & Skills [00:10:00 - 00:11:20]
+Disable Unused Tools: Every tool is sent in the context window. Use Hermes list to see them, and tools disable [name] or the desktop app to turn off tools you don't use (e.g., code execution for non-coders) [10:15].
+
+Disable Unused Skills: Turn off any of the pre-installed skills you don't use [10:41].
+
+Disconnect Unused MCP Servers: Each server brings its own tools into context. Disconnect idle ones [10:56].
+
+Tool Search to Auto: Ensure tool search is set to auto (like Claude's tool use) so it only loads a tool when needed, rather than keeping all of them in the window [11:02].
+
+Settings to Adjust: Hard Limits [00:11:21 - 00:12:34]
+Max Tokens: Set a hard limit on max tokens to control output length and stop the model from rambling [11:22].
+
+Max Turns: The default is 150 turns for the agent to think and call tools. Drop this to something like 60 so the agent doesn't burn tokens looping when confused [11:40].
+
+Hard Stop: Change the hard stop setting from false to true. This detects looping and stops the agent from grinding away [12:09].
+
+Cron Job Limits: Background cron jobs have no default max turn limit. Set a specific number so they can't run infinitely and eat up costs [12:20].
+
+The remainder of the video (00:12:35 onward) promotes their AI Labs Pro community and thanks the viewers.
