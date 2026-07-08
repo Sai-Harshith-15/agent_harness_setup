@@ -3,7 +3,6 @@
 All store operations run against an isolated tmp-dir SQLite so the production
 hooks/ directory is never touched during CI.
 """
-import os
 import pytest
 from fastapi.testclient import TestClient
 

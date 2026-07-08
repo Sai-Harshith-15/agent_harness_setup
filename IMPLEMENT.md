@@ -14,6 +14,7 @@
 | 4 | P4-1 | harness triad + check_harness.py green | opencode | true | 2026-07-08 |
 | 4 | P4-2 | /dashboard/vault browse endpoint wired | opencode | true | 2026-07-08 |
 | 5 | P5-1 | 24/24 tests green; reindex delta-aware; compact respects budget; graph+drift+headroom endpoints live; ruff clean | antigravity | false | 2026-07-08 |
+| 6 | P6-1 | 5/5 tests green; permissions matrix, OCC locks, hitl queue, hibernation, and crash reconciliation wired | antigravity | false | 2026-07-08 |
 
 ---
 
@@ -114,6 +115,39 @@
 
 **Next:**
 - Ready for Phase 4: Per-project harness contract.
+
+---
+
+### 2026-07-08 03:40 — Phase 5 Complete
+
+**What happened:**
+- Implemented Phase 5: Indexing & generation.
+- Agent id: antigravity
+- Created `context_server/app/indexing/*` components.
+- Integrated file system graphification, deterministic compaction, and drift detection.
+- Rewrote endpoints for `/mcp/reindex`, `/mcp/compact`, `/dashboard/graph`, and `/dashboard/drift`.
+
+**Decision:**
+- Wrote full test coverage in `test_phase5.py`.
+
+**Next:**
+- Phase 6: Governance & resilience.
+
+---
+
+### 2026-07-08 03:45 — Phase 6 Complete
+
+**What happened:**
+- Implemented Phase 6: Governance & resilience.
+- Agent id: antigravity
+- Wired permissions matrix, lock leasing with OCC validation, and hitl hibernation endpoints.
+- Implemented `reconcile()` to reap orphaned leases on startup and hook into dashboard.
+
+**Decision:**
+- Updated the legacy `append_implement` to use the strict governance components, replacing dummy mocks.
+
+**Next:**
+- Awaiting next Phase instructions.
 
 ---
 

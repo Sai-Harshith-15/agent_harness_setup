@@ -362,6 +362,7 @@ without ambiguity (per the writing-effective-tools principle from the harness RE
 | `request_credentials` | service registry (e.g. "AWS","GitHub") | injects scoped ephemeral creds into sandbox env |
 | `acquire_lock`      | lock manager state                     | takes a lease on a resource path (file/domain) |
 | `request_snapshot`  | workspace VCS / filesystem             | creates a named restore point before destructive ops |
+| `delegate_task`     | registry/agents + PLAN.md              | spawns a child task under another agent; child spans nest under caller's OTel trace (Phase 3.3) |
 
 Design rules (from harness-discipline guidance):
 - **Progressive tool disclosure:** the full tool set is *not* loaded into the system prompt. The
@@ -417,6 +418,16 @@ account for cost. Beyond the Phase 7 token ledger, the context server emits stru
   `context` / `constraint` / `planning` so root-cause is not guesswork. This feeds the Phase 8
   meta-agent and Dream Cycle.
 - **Retention:** raw spans kept N days; rollups to `registry/log.md` per Phase 7 cadence.
+- **Logical sequence counters (clock-drift neutralization).** In hybrid environments (claude-code
+  in a remote E2B microVM, opencode local on the host), wall-clocks inevitably drift — even 200ms
+  desync breaks span nesting (child spans appearing to finish before they start, negative
+  latencies) and corrupts Phase 2.8 token-expiry checks during a Phase 6.6 thaw. The Context
+  Server therefore **decouples telemetry and ordering from the host wall-clock**: every span and
+  every identity-token baggage header carries a **monotonically increasing logical sequence
+  number** (Lamport timestamp) issued strictly by the primary server process. Spans are ordered
+  and nested by logical sequence position, not `end_at`/`start_at` timestamps; wall-clock values
+  are kept only as human-readable hints. This keeps multi-sandbox trajectories coherent
+  regardless of clock skew.
 
 This is what turns "the agent failed" into "the agent failed because step 14 loaded a stale OKF
 concept" — the same diagnosis loop the harness discipline calls trajectory-level observability.
@@ -433,7 +444,21 @@ exclusion on the Secondary Brain and project files, concurrent writes to `IMPLEM
   lease are refused.
 - Locks are keyed by `(agent, resource_path, task_id)` so an agent's failure releases stale
   leases on TTL expiry (no permanent deadlock).
-- The lock table itself is append-only and logged, so contention is visible in the Phase 2.5 trace.
+- **DAG deadlock detector (cyclic-wait prevention).** Every `acquire_lock` request *and* every
+  Phase 3.3 `delegate_task` instantiation is recorded as a directed edge in a server-side
+  **task-dependency DAG**: an edge `T_holder → T_requester` means "task T_requester is blocked
+  waiting for a resource held by T_holder" (delegation edges: parent → child). Before granting a
+  lease, the server checks whether the new edge would create a *cycle*. If it would, the lease is
+  **instantly refused** with a `deadlock_risk` exception (carrying the would-be cycle path) — the
+  requesting agent must then yield its current locks, abort, or enter Phase 6.6 hibernation, rather
+  than stalling the loop. This matters because Phase 3.3 delegation across multiple agents turns
+  the lock table into a multi-agent dining-philosophers graph; the 120s TTL would eventually break
+  a real deadlock, but a 2-minute full lockup breaks real-time execution and silently inflates CAPO
+  (Phase 7.4) via useless retry spend. The DAG rejects the cycle *before* the wait begins, so no
+  stall ever forms. Cycle-detection is O(V+E) per request against a graph bounded by live tasks,
+  so it is cheap relative to the cost of a deadlock.
+- The lock table itself is append-only and logged, so contention (and any refused `deadlock_risk`
+  edges) is visible in the Phase 2.5 trace.
 
 #### 2.7 Secrets manager bridge (credential injection)
 
@@ -448,18 +473,274 @@ context (prompt injection could exfiltrate them).
 - All `request_credentials` calls are traced (Phase 2.5) with the service name and lease TTL, but
   never the secret value.
 
+#### 2.8 Zero-trust identity (transport-layer authentication)
+
+Phase 2.4 relies on "identity propagation" where every tool call carries the calling agent's
+identity and task id. **If that identity is self-reported inside the tool payload** (e.g.
+`{ "agent": "opencode" }`) it is vulnerable to prompt injection: a compromised agent could send a
+payload claiming to be the meta-agent and bypass the Phase 6.2 Permission Matrix to escalate write
+privileges. Identity must be enforced at the connection/transport layer, never the payload layer.
+
+- **Per-agent signed local token at startup.** When the OS provisions an agent (Phase 3
+  registration + Phase 5 config generation), it issues that agent a unique, short-lived, signed
+  identity token (e.g. HMAC over `{agent_id, task_id, issued_at, exp}`). The token is delivered
+  out-of-band to the agent process (env var / startup handshake), **never via the LLM prompt**.
+- **Transport binding, not payload binding.**
+  - HTTP MCP server: the agent presents its token in an `Authorization` / `X-Agent-Identity` header
+    on every request. The Context Server extracts identity strictly from the authenticated
+    connection.
+  - stdio / socket MCP: the server validates the peer PID / socket credential
+    (`SO_PEERCRED` on Linux, named-pipe ACL on Windows) and maps it to a registered agent via a
+    startup-supplied PID→agent table.
+- **Payload identity is ignored.** Any `agent` / `task_id` field the LLM places in the JSON body
+  is treated as untrusted hint text only; the server overwrites it with the transport-derived
+  principal. A mismatch (payload claims a different agent than the transport proves) is logged as
+  a `identity_spoof_attempt` failure class in the Phase 2.5 trace and counted toward the Phase 2.9
+  circuit breaker.
+- **Token revocation / rotation.** Tokens are task-scoped and expire with the task's `bounds`
+  window; the Phase 6.6 Hibernation Protocol re-issues a fresh token on state hydration so a
+  resumed task is not bound to a stale credential.
+- **Logical clock for expiry (clock-drift safe).** The signed token payload carries a
+  **monotonically increasing logical sequence step** (Lamport timestamp, per Phase 2.5) in
+  addition to `issued_at`/`exp`. Expiry and freshness are validated against the server's logical
+  sequence counter, **not** the host wall-clock — so a token minted in a remote E2B microVM and
+  validated during a Phase 6.6 thaw on the local host is never rejected as prematurely expired
+  due to clock skew, and never accepted past its logical step budget. Wall-clock fields remain
+  for human display only.
+- **Mandatory for all writes.** The Phase 6.2 Permission Matrix is evaluated against the
+  transport principal, not the body. This is what makes the matrix survive prompt injection.
+
+**Why this matters:** this is the difference between a permission system the LLM can talk its way
+past and one it cannot. It closes the zero-trust gap that v1.1 left open by relying on
+self-reported payload identity.
+
+#### 2.9 Server-side circuit breaker (infinite-loop defense)
+
+Phase 7.2 caps tokens via `max_turns` and hard caps, but agents frequently get stuck in *tight
+logic loops* — repeatedly calling `search_notes` with the exact same failed query, or re-running a
+broken tool hoping for a different result. A looped agent spams the Context Server, artificially
+inflates the Phase 7.3 token database, and can DDoS the local lock manager or FastAPI instance.
+`max_turns` is too coarse to catch this; the loop lives inside one turn budget.
+
+- **Argument-hash replay detection.** Phase 2.5 already hashes the arguments of every tool call
+  (`args-hash`). The Context Server maintains a sliding window per `(agent, task_id, tool)` of the
+  last N `args-hash` values.
+- **Trip condition.** If the *exact same* `(tool, args-hash)` combination is observed **≥ N times
+  within a short wall-clock window** (defaults: N=3, window=60s; tuned via Phase 2.5 trace stats),
+  the breaker trips *on the server side*, before the tool executes again.
+- **On trip:**
+  1. The repeated call is refused with a structured `circuit_breaker_tripped` error carrying the
+     repeated hash and the trip count — the agent gets a clear signal, not silence.
+  2. The event is tagged `circuit_breaker` in the Phase 2.5 trace and written to
+     `IMPLEMENT.md` by the context server (not the agent) so the loop is auditable.
+  3. The Phase 6.5 `request_clarification` HITL handoff is **auto-triggered** — the loop is
+     escalated to a human instead of burning the turn budget silently.
+- **Half-open recovery.** After a trip, the breaker stays open for a cool-down interval; the next
+  call is allowed through as a *probe*. A probe that succeeds with a *different* args-hash resets
+  the window; a probe that repeats the same hash re-trips immediately and re-escalates HITL.
+- **Scope.** Per `(agent, task_id, tool)` — a healthy agent calling `search_notes` with varied
+  queries is unaffected; only identical, rapid, repeated calls trip. This keeps the breaker from
+  false-positive-ing on legitimate retry-with-backoff patterns.
+
+This turns "the agent looped for 60 turns and I only found out from the bill" into "the agent
+looped twice, the OS caught it on the third identical call, and a human was pinged."
+
+#### 2.10 Optimistic concurrency control (read-modify-write protection)
+
+Phase 2.6's distributed lock manager prevents *concurrent* writes by requiring a time-bounded
+lease, but it does not prevent a **lost update across multiple turns**. Agent A reads `script.py`,
+spends 5 turns reasoning, then acquires a lock and writes. During those 5 turns Agent B acquired
+the lock, edited `script.py`, and released it. Agent A's write now succeeds and **silently
+overwrites Agent B's logic** because A is acting on a stale mental model of the file — the lock
+guarantees mutual exclusion at write time, not freshness at read time.
+
+- **ETag / Git-SHA version hash on every read.** When the Context Server serves a read tool
+  (`read_note`, `get_concept`, `search_okf` results, or a sandbox file read routed through the
+  server), it attaches a **content version hash** to the returned payload — the file's git blob SHA
+  for tracked files, or a fast content hash (e.g. xxhash) for untracked `log.md` / `IMPLEMENT.md`.
+  The agent stores this hash alongside its read of the resource.
+- **Hash required on write.** Every write tool (`append_implement`, `log_decision`, file edits
+  routed through the server) must carry the `expected_version` hash of the resource it is modifying,
+  sourced from the agent's most recent read of that resource.
+- **Reject-on-stale.** On write, the server recomputes the current hash of the target; if it
+  differs from `expected_version`, the write is refused with a structured `state_changed` error
+  carrying the current hash. The agent is forced to **re-read before re-writing** — it cannot
+  clobber a change it never observed.
+- **Append-only exception.** `log.md` and `IMPLEMENT.md` are append-only ledgers; for these the
+  hash check is replaced by a *position* check (expected tail offset), so concurrent appends are
+  serialized without false `state_changed` rejections. Full-content hash checks apply to mutable
+  files and OKF concepts only.
+- **Interaction with the lock manager (Phase 2.6).** OCC and locks are **complementary**, not
+  alternatives: the lock serializes the write instant; OCC guarantees the write is based on a
+  current view. A flow may hold a lock yet still fail OCC if it read stale data *before* acquiring
+  the lock — which is exactly the lost-update scenario this closes.
+- **Interaction with hibernation (Phase 6.6).** The hibernation record stores the version hashes
+  the task last read; on thaw, the stale-on-thaw drift re-check is implemented *as* an OCC
+  comparison — if any watched resource's hash changed during hibernation, the resumed agent is
+  handed a `state_changed` banner before it touches anything, unifying hibernation and OCC under
+  one staleness primitive.
+
+**Why this matters:** this is the difference between "the write succeeded" and "the write was
+correct relative to the world the agent thinks it lives in." Without OCC, a multi-turn agent is a
+silent data-corruption vector even with locks in place.
+
+#### 2.11 Rate limiting + compute quota (resource protection)
+
+Phase 2.9's circuit breaker trips on *identical* repeated calls, and Phase 7.2 caps `max_turns`.
+But nothing stops an agent from rapidly firing **500 unique, expensive** queries — e.g. running
+`search_okf` across massive bundles with slightly different arguments each time. This evades the
+Phase 2.9 breaker (args differ each call) while overwhelming a local LLM runner or exhausting an
+API budget in minutes. `max_turns` is turn-count coarse; it does not see burst rate.
+
+- **Token-bucket rate limiter per `(agent, task_id)`.** The Context Server enforces a maximum
+  requests-per-minute (RPM) and a per-tool compute-cost quota (weighted: a `search_okf` over a
+  large bundle costs more than a `lookup_agent`). Defaults derived from the task's `bounds` and
+  the adapter's `cost_defaults` (Phase 7.2).
+- **On burst over the limit:** the server returns a `429 Too Many Requests` (or the MCP-equivalent
+  delay/queue signal) with a `Retry-After` hint, forcing the agent to throttle its pace rather than
+  burn host resources. The refused call is still traced (Phase 2.5) as `rate_limited` so the
+  throttle is visible in the trajectory, not silent.
+- **Quota, not just rate.** Beyond RPM, a hard per-task compute-quota ceiling (token-equivalent
+  units) acts as a circuit-breaker-of-last-resort: an agent that burns its quota mid-task is
+  auto-paused into the Phase 6.6 hibernation flow for human review, not allowed to overspend.
+- **Distinguishing rate-limit from circuit-breaker.** Phase 2.9 catches *repetition* (same call,
+  likely a stuck loop → HITL); Phase 2.11 catches *volume* (many distinct calls, possibly
+  legitimate exploration → throttle and let it proceed slower). Both feed the same Phase 7.3
+  token accounting so cost is attributed either way.
+
+**Why this matters:** this protects the host (CPU, local LLM runner) and the budget (API spend)
+from a well-meaning but over-eager agent, distinct from the malicious/stuck agent the breaker
+catches.
+
+#### 2.12 Data-loss-prevention middleware (trace + log sanitization)
+
+Phase 2.7 ensures raw API keys never sit in agent-readable context via the secrets bridge. But
+secrets can enter the system through paths the secrets bridge does not cover: a user accidentally
+pastes an AWS key into an Obsidian note (Phase 1.1), an LLM hallucinates a sensitive internal
+token into a tool result, or a scraped web page contains PII that gets logged. Without
+intervention, that plaintext is **permanently written** to the Phase 2.5 OTel traces, the
+append-only `IMPLEMENT.md` (Phase 4.3), and the OKF bundles (Phase 4.2) — a durable leak.
+
+- **DLP middleware in the write path.** Before any output is persisted to disk, shipped to
+  Langfuse, or committed to an OKF bundle, the payload passes through a **high-entropy regex
+  scrubber** in the Context Server. Patterns cover known secret shapes (AWS `AKIA…`, Stripe
+  `sk_live_…`, GitHub `ghp_…`, Slack tokens, generic high-entropy strings) plus configurable PII
+  patterns (emails, phone numbers, credit-card-shaped digit runs).
+- **Redaction, not rejection.** Matched spans are replaced with a `[REDACTED:<kind>:<hash6>]`
+  token (the short hash lets a human with the vault re-identify *which* secret it was without the
+  secret itself being present). The write proceeds so the agent's workflow is not blocked, but the
+  secret never lands in a durable store.
+- **Redaction log.** Every redaction is itself a traced event (`pii_redacted` / `secret_redacted`
+  failure-class in Phase 2.5) so the human can see *that* a leak was attempted and *where*, and
+  root-cause it (e.g. "the source Obsidian note `X` contains a pasted key — go rotate it").
+- **Source-side sweep.** The DLP layer also runs on the Phase 4.2 Obsidian→OKF export hook and on
+  `read_note` *return* payloads, so a secret pasted into Obsidian is caught at the boundary before
+  it ever reaches an agent's context in the first place — defense at both the read edge and the
+  write edge.
+- **Vault coordination.** When a redaction matches a known secret shape, the Phase 2.7 secrets
+  bridge is consulted: if the redacted value *is* a registered credential, an alert is raised
+  (a registered secret leaked into prose = a rotation event); if it is unrecognized, it is
+  surfaced as a "suspected leaked credential" candidate in the Phase 7 evening review.
+
+**Why this matters:** Phase 2.7 stops the OS from *handing* secrets to agents; Phase 2.12 stops
+secrets that slipped in anyway from being *immortalized* in traces and logs. Together they form a
+full DLP boundary around the durable stores.
+
+#### 2.13 Read-edge context chaperoning (denial-of-context defense)
+
+Phase 6.2 blocks untrusted-provenance inputs from reaching *destructive write* tools, and Phase
+2.12 redacts secrets from durable stores. But adversarial read loops are unaddressed: an agent
+that reads an untrusted external file or webpage containing a malicious injection can be commanded
+to run an **infinite, randomized loop of read-only tools** — hundreds of unique `search_notes` /
+`search_okf` calls with high-entropy keywords. This evades the Phase 2.9 circuit breaker (args
+hashes differ every call) and slips under Phase 2.11 rate limiting if paced carefully. The
+payload is denial-of-*context*: OTel trace storage explodes, the Phase 5.4 compactor gets
+throttled summarizing trash text, and append-only logs flood with nonsense — blinding the Phase 7
+evening human review.
+
+- **Untrusted-provenance read isolation.** When an agent reads data flagged with an untrusted
+  provenance tag (per Phase 6.2's instruction-provenance tracking), the Context Server temporarily
+  **isolates that task's telemetry stream** into a chaperoned branch. Reads are still allowed (the
+  open loop must be able to process the untrusted content), but the branch is marked
+  `untrusted_processing`.
+- **Macro-span collapsing.** While the chaperoned branch is open, the server **collapses
+  duplicate or high-frequency read spans into a single aggregated macro-span wrapper**, dropping
+  individual high-entropy arguments from permanent trace storage (a count + the first/last args
+  are retained as samples, not the full firehose). This bounds trace growth to O(1) per branch,
+  not O(calls), so a 500-call read loop produces one macro-span, not 500 spans.
+- **Branch-exit flush.** When the agent exits the untrusted processing branch (signals it is done
+  with the untrusted content, or the Phase 2.9 breaker / Phase 2.11 limiter trips), the macro-span
+  is sealed and a single summary entry is written to `IMPLEMENT.md` — the human review pipeline
+  sees one line ("agent processed untrusted source X, made N read calls"), not a flooded log.
+- **Compactor protection.** The Phase 5.4 compactor treats chaperoned branches as already-summarized
+  and skips them, so it is not throttled re-summarizing injected trash — the DoC attack cannot
+  starve the compactor's budget for legitimate history.
+- **Coupling with the rate limiter.** Chaperoning is *complementary* to Phase 2.11: the limiter
+  caps raw call volume; the chaperon ensures whatever volume *does* get through is not
+  immortalized token-for-token. A burst that trips the limiter inside a chaperoned branch
+  auto-escalates to Phase 6.5 HITL, since an untrusted-source-driven burst is the highest-risk
+  read pattern.
+
+**Why this matters:** without chaperoning, a single malicious read source can blind the entire
+observability + review pipeline by drowning it in noise — a denial-of-context attack that the
+write-side controls (6.2) and the secret-side controls (2.12) are structurally blind to, because
+no destructive write and no secret ever occurs.
+
 **Definition of Done (Phase 2):**
 - [ ] `contracts/mcp_tools.md` documents the tool surface, payloads, and annotations, including
-  the progressive-disclosure tools (`search_tools`, `load_tool_schema`).
-- [ ] `contracts/observability.md` documents the OTel/Langfuse span schema + failure-class tags.
-- [ ] `contracts/lock_manager.md` documents lease semantics, default TTL, and the lock table.
+  the progressive-disclosure tools (`search_tools`, `load_tool_schema`) and the `delegate_task`
+  tool (Phase 3.3).
+- [ ] `contracts/lock_manager.md` documents lease semantics, default TTL, the lock table, **and**
+  the task-dependency DAG deadlock detector with `deadlock_risk` refusal on cyclic edges
+  (covering `acquire_lock` + `delegate_task` edges) (Phase 2.6).
+- [ ] `contracts/observability.md` documents the OTel/Langfuse span schema + failure-class tags
+  **and** the logical sequence counter (Lamport timestamp) ordering that neutralizes cross-sandbox
+  wall-clock drift (Phase 2.5).
+- [ ] `contracts/identity.md` documents the signed-token issuance, transport binding (HTTP header
+  vs. PID/socket), payload-identity override rule, `identity_spoof_attempt` failure class, token
+  rotation on hibernation, **and** the Lamport logical-sequence-step expiry that replaces
+  wall-clock validation across distributed VM sandboxes (Phase 2.8).
 - [ ] `contracts/secrets_bridge.md` documents the `request_credentials` flow and sandbox injection.
+- [ ] `contracts/read_chaperon.md` documents the untrusted-provenance read branch, macro-span
+  collapsing with sampled args, branch-exit flush to `IMPLEMENT.md`, compactor skip, and the
+  limiter-coupled HITL escalation (Phase 2.13).
+- [ ] `contracts/circuit_breaker.md` documents the args-hash replay window, trip defaults (N / window),
+  half-open probe semantics, and the auto-HITL escalation (Phase 2.9).
+- [ ] `contracts/occ.md` documents the version-hash-on-read, `expected_version`-on-write,
+  `state_changed` rejection, append-only position-check exception, and hibernation interaction
+  (Phase 2.10).
+- [ ] `contracts/rate_limit.md` documents the token-bucket RPM, per-tool cost weighting, `429` /
+  `Retry-After` semantics, per-task compute-quota ceiling, and the auto-hibernate-on-quota-exhaustion
+  handoff (Phase 2.11).
+- [ ] `contracts/dlp.md` documents the regex scrubber patterns, `[REDACTED:...]` token format,
+  redaction-event tracing, read-edge + write-edge + export-hook coverage, and secrets-bridge
+  coordination (Phase 2.12).
 - [ ] `registry/adapters/context-server.md` exists (`type: ContextServer`) listing the tool set.
 - [ ] Registry now also advertises the context server's connection string/conventions.
 - [ ] A dry run shows `search_okf` returning one concept from `registry/agents/hermes.md`.
 - [ ] A dry run shows `acquire_lock` + a gated write succeeding, and a leaseless write refused.
 - [ ] A dry run shows `request_credentials` injecting an ephemeral credential into an empty sandbox
   without the secret value entering the trace.
+- [ ] A dry run shows a payload-claimed identity being **ignored** in favor of the transport
+  principal, with the mismatch logged as `identity_spoof_attempt` (Phase 2.8).
+- [ ] A dry run shows the breaker tripping on the Nth identical `(tool, args-hash)` call, returning
+  `circuit_breaker_tripped`, and auto-triggering `request_clarification` (Phase 2.9).
+- [ ] A dry run shows OCC rejecting a write whose `expected_version` is stale (file changed between
+  read and write) with `state_changed`, and the agent re-reading successfully (Phase 2.10).
+- [ ] A dry run shows a burst of distinct expensive calls being throttled with `429` + `Retry-After`
+  and traced as `rate_limited`, while a quota-exhausted task auto-hibernates (Phase 2.11).
+- [ ] A dry run shows a pasted AWS-key-shaped string in an Obsidian note being redacted to
+  `[REDACTED:aws_key:...]` on both `read_note` return and OKF export, with a `secret_redacted`
+  trace event and a secrets-bridge rotation alert (Phase 2.12).
+- [ ] A dry run shows the DAG deadlock detector refusing a cyclic `acquire_lock` (or
+  `delegate_task`) edge with `deadlock_risk` *before* the wait forms, vs. granting an acyclic
+  one (Phase 2.6).
+- [ ] A dry run shows spans ordered by logical sequence counter (not wall-clock) across a
+  simulated remote-E2B + local-host clock skew, with no negative latencies, and a token
+  validated by logical step rather than `exp` (Phase 2.5 / 2.8).
+- [ ] A dry run shows an untrusted-provenance read loop of N unique calls collapsed into a single
+  macro-span with sampled args and one `IMPLEMENT.md` summary line, vs. a trusted read loop
+  recorded span-for-span (Phase 2.13).
 - [ ] No agent has been wired yet — wiring is Phase 3.
 
 ---
@@ -506,7 +787,48 @@ config location and register it in `registry/agents/<agent>.md`:
 5. **codex** — uses `AGENTS.md` natively (per OpenAI's Plan.md/Implement.md discipline in the
    harness README). Adapter is the canonical mapping — adapter Almost-a-no-op.
 
-#### 3.3 The registration ritual (documented once, repeated forever)
+#### 3.3 Inter-agent delegation contract (the `delegate_task` tool)
+
+Phase 3.2 acknowledges that agents like opencode and claude-code support native sub-agents. But
+delegating purely through each agent's *native* sub-agent protocol (opencode subagents, claude-code
+Task tool, Codex sub-agents) **bypasses the OS's control plane**: those calls are invisible to the
+Phase 2.5 trajectory trace, ungated by the Phase 6.2 Permission Matrix, and unrecorded in
+`PLAN.md`. To keep all orchestration inside the harness, delegation goes through a single
+context-server tool.
+
+- **The tool:** `delegate_task` (added to the Phase 2.2 tool surface). Payload is structured, not
+  free text: `{ delegate_to, task_spec, input_bindings, expected_output, bounds }`.
+  - `delegate_to`: a registered agent id from `registry/agents/` (validated against the
+    transport-authenticated caller — Phase 2.8; the caller *cannot* delegate as someone else).
+  - `task_spec`: a self-contained scope string written into `PLAN.md` as a child task.
+  - `input_bindings`: which OKF concepts / files / locks the child is allowed to touch — inherited
+    from the parent's `bindings` by default, narrowed only.
+  - `expected_output`: the contract the child must satisfy for the delegation to count as done.
+  - `bounds`: CPU/wall-clock/token budget for the child, ≤ the parent's remaining budget.
+- **What the Context Server does on `delegate_task`:**
+  1. Writes a **child task** row into the project's `PLAN.md` (parented to the caller's task_id),
+     so delegation is visible in the plan, not hidden in a side channel.
+  2. Provisions a **new sandbox** (Phase 0.5) for the child with the narrowed `input_bindings`.
+  3. Issues the child agent its own **signed identity token** (Phase 2.8) — the child's writes are
+     attributed to the child, not the parent, in the audit ledger.
+  4. **Nests OTel spans:** every tool call the child makes becomes a child span under the parent's
+     task trace (Phase 2.5), so a delegated sub-tree is a single replayable trajectory.
+  5. Applies the Phase 6.2 Permission Matrix to the child independently — delegation never widens
+     privilege; a parent without filesystem-write cannot delegate filesystem-write.
+- **Completion contract.** When the child's Phase 6.3 gate passes, the result (compressed via
+  headroom if bulky) is returned to the parent's context as the tool's return value, and the
+  `PLAN.md` child row is marked done. If the child fails or hits the Phase 2.9 circuit breaker,
+  the failure class propagates up the span tree and the parent can choose to retry, re-delegate,
+  or call `request_clarification`.
+- **Recursion guard.** `delegate_task` depth is capped (default 3) and counted toward the parent's
+  `max_turns` budget so a chain of delegations cannot silently spend the whole turn budget. Each
+  hop is visible as its own span subtree.
+
+**Why this matters:** without this, "Claude delegates a search to opencode" happens through
+claude-code's private Task protocol — invisible to your OS. With `delegate_task`, every
+cross-agent hop is a first-class, traced, permission-gated, plan-recorded event.
+
+#### 3.4 The registration ritual (documented once, repeated forever)
 
 To add a new agent `X`:
 1. Create `registry/agents/X.md` (OKF `type: Agent`).
@@ -523,7 +845,11 @@ say "agent X is now part of the OS."
 - [ ] All five have a `bindings` field naming their OKF bundle paths.
 - [ ] `registry/adapters/` has at least three adapter concepts (hermes, opencode, claude-code).
 - [ ] The "registration ritual" is documented in `registry/adapters/index.md`.
+- [ ] `contracts/delegation.md` documents the `delegate_task` payload, sandbox provisioning, span
+  nesting, permission narrowing, recursion guard, and completion contract (Phase 3.3).
 - [ ] `registry/index.md` lists all five agents + the context server + the adapters.
+- [ ] A synthetic delegation (opencode → claude-code) shows a child task row in `PLAN.md`, a
+  nested OTel span subtree, and the child's writes attributed to the child principal.
 
 ---
 
@@ -664,6 +990,22 @@ stale. An agent reading a stale OKF concept will assume it reflects live code an
   review, and (b) the Phase 8 meta-agent / Dream Cycle as a "sync candidate."
 - A stale concept is **read-restricted**: context-server `get_concept` still returns it but with
   a visible `Status: Stale` banner so agents treat it as a hint, not ground truth.
+- **Vector-space centroid shift (semantic drift).** Phase 5.7 delta-indexing patches graph
+  nodes/edges cleanly per change, but **vector spaces do not delta-patch**: weeks of incremental
+  embedding injections silently shift cluster centroids, so old documentation partitions drift
+  semantically distant from newly patched modules. The agent then queries the vector store and
+  misses a relevant note — localized "context blindness" with no code-level signal. The drift
+  engine therefore also monitors **Embedding Density Variance**: the ratio of incremental vector
+  injections to total files. When that ratio crosses a configured threshold, the index is flagged
+  not merely `status: stale` (code drift) but `status: semantic_drift_detected` (vector drift),
+  and a read-restriction banner distinguishes the two so the agent knows *which* kind of
+  untrustworthiness it is hitting.
+- **Asynchronous re-normalization.** A `semantic_drift_detected` flag does **not** trigger a
+  synchronous full re-embedding (that would re-introduce the Phase 5.7 bottleneck mid-task).
+  Instead it schedules an **offline, asynchronous background re-indexing pass** that runs
+  exclusively inside the Phase 8.2.1 Dream Cycle evening window, re-normalizing the vector space
+  so the semantic retrieval layer stays as unified as the graph layer without ever locking the
+  context server during agent hours.
 
 #### 5.6 Progressive tool disclosure (mechanization)
 
@@ -671,6 +1013,37 @@ Phase 2 specifies `search_tools` + `load_tool_schema`; here we wire the backing 
 context server builds a tool index from `registry/capabilities/*` plus each project's declared
 project-local tools (from `AGENTS.md`), and serves `search_tools` queries against it. Full
 schemas are loaded on demand only — keeping the default system prompt minimal across all agents.
+
+#### 5.7 Incremental (delta) indexing (scale safeguard)
+
+Phase 5.3's workflow (edit in Obsidian → export → regenerate → **re-index graph**) and Phase 5.1's
+`index_repository` work fine at the current scale (1,684 nodes / 3,173 edges). At enterprise scale
+(e.g. 50,000+ files, or a monorepo with many projects under one OS), triggering a **full
+wipe-and-rebuild** of the Phase 2.3 graph backend on every save creates a massive computational
+bottleneck — the secondary brain is locked for indexing while the agent waits, defeating the
+purpose of having a live context layer.
+
+- **Delta updates, not full rebuilds.** The Phase 4.2 Obsidian→OKF export hook and the Phase 5.1
+  indexer are upgraded to emit **delta patches**: on a change event the system patches *only* the
+  added / modified / deleted nodes (and their incident edges) into the existing graph, rather than
+  re-walking the whole repo.
+- **Change attribution.** A delta carries `(node_id, op, new_signature, new_content_hash,
+  affected_edge_set)`; the graph backend applies the patch transactionally and records the delta id
+  in the Phase 2.5 trace so an index state is reconstructable at any point.
+- **Degradation-to-full.** A full `index_repository` rebuild remains available as an explicit
+  repair command (corruption recovery, schema migration, or after a configurable N deltas when
+  drift between the delta-applied graph and a from-scratch graph exceeds a threshold — the same
+  drift-detection primitive as Phase 5.5, applied to the index itself).
+- **Lock window shrinkage.** Because deltas are bounded, the lock the indexer holds on the graph
+  backend (Phase 2.6) is held for seconds, not minutes — concurrent agent reads are barely
+  interrupted even at large scale.
+- **Coupling to drift detection (Phase 5.5).** Phase 5.5 runs *after* a delta is applied, not after
+  a full reindex, so staleness of OKF concepts is caught per-change in near-real-time instead of
+  once per full reindex cycle.
+
+**Why this matters:** without delta indexing, scaling the OS past a handful of repos makes the
+"edit → agent sees new context" loop latency climb from seconds to tens of minutes, and the
+indexer becomes a single-host bottleneck. Delta updates keep the secondary brain live at scale.
 
 **Definition of Done (Phase 5):**
 - [ ] `registry/adapters/` lists each indexer as a concept.
@@ -681,6 +1054,15 @@ schemas are loaded on demand only — keeping the default system prompt minimal 
 - [ ] The compactor fires once on a long synthetic session and the OTel span shows the compaction.
 - [ ] Drift detection flags an intentionally-stale `okf/` concept as `status: stale` after a
   simulated code-graph divergence.
+- [ ] Drift detection flags `status: semantic_drift_detected` after a simulated run of incremental
+  vector injections crosses the Embedding-Density-Variance threshold, and an asynchronous
+  re-normalization pass (Dream Cycle window) clears the flag without locking the context server
+  (Phase 5.5 / 8.2.1).
+- [ ] `contracts/delta_indexing.md` documents the delta patch schema, transactional apply,
+  degradation-to-full repair trigger, and lock-window budget (Phase 5.7).
+- [ ] A proof-of-concept shows a single-file change patching the graph via delta (sub-second,
+  short lock) vs. a full reindex, and the delta-applied graph matching a from-scratch graph within
+  the configured drift threshold (Phase 5.7).
 
 ---
 
@@ -724,6 +1106,11 @@ on the **instruction provenance**: a tool call whose trigger content came from a
 (a fetched web page, a scraped doc) cannot pair with private-data or external-egress tools in the
 same session unless a human explicitly elevates. This is a server-side control, not a prompt-level
 hint, so it survives prompt injection.
+- **Read-side mirror (Phase 2.13).** The provenance tag that drives the lethal-trifecta write gate
+  *also* drives read-edge context chaperoning: an untrusted-provenance read branches the task's
+  telemetry into an isolated, macro-span-collapsed stream so a malicious read loop cannot flood
+  traces and blind the evening review. Provenance is thus the single primitive gating both the
+  write edge (here) and the read edge (Phase 2.13).
 
 #### 6.3 Verification gate per task
 
@@ -768,6 +1155,102 @@ loop, serializes current state, and pushes a notification (CLI prompt / webhook)
 unblock ambiguity instead of the agent hallucinating or failing outright. This closes the gap left
 by Phase 7's purely-asynchronous daily flow.
 
+#### 6.6 Hibernation protocol (zombie-task resolution)
+
+Phase 6.5 pauses the agent loop on `request_clarification`, but three other phases create a
+conflict when the pause is long: Phase 0.5 says sandboxes are ephemeral and torn down at task end;
+Phase 2.6 says lock leases are time-bounded (default 120s TTL); Phase 2.8 says identity tokens are
+task-scoped and short-lived. **If a human takes 18 hours to answer a clarification**, the
+intuitive outcomes are all bad: keep the sandbox alive and it burns idle compute memory; let the
+lock lease expire and another agent may alter the file mid-pause; let the sandbox hit its hard
+timeout and the entire in-progress state is lost. A production harness must hibernate, not stall.
+
+- **On `request_clarification` (the freeze step):**
+  1. **Serialize agent memory state.** The Context Server fully serializes the agent's working
+     state — active OKF concept pointers, lock set, accumulated Phase 2.5 trace/span id, sandbox
+     filesystem delta (diff against the Phase 6.4 pre-task snapshot), and the open clarification
+     prompt — into a hibernation record keyed by `task_id`, stored durably (not in the sandbox).
+  2. **Voluntarily release all active locks** (Phase 2.6). The lock table entry is marked
+     `released:hibernation` rather than `expired`, so the evening review can distinguish a
+     deliberately-paused task from a deadlocked one.
+  3. **Explicitly terminate the sandbox** (Phase 0.5). No idle compute burn; no leaked process.
+  4. **Revoke the identity token** (Phase 2.8). The paused task holds no live credential.
+  5. The task is marked `state: hibernated` in `PLAN.md` and surfaced in the Phase 7 evening
+     review so a long-paused task does not vanish.
+- **On human answer (the thaw step):**
+  1. The OS provisions a **fresh sandbox** (Phase 0.5) with the same `bounds` as the original.
+  2. **Re-acquires the necessary locks** (Phase 2.6). If a lock is now held by another agent
+     (because it was released at freeze), thaw blocks on `acquire_lock` rather than silently
+     overwriting — the conflict is surfaced, not created.
+  3. **Re-issues a fresh identity token** (Phase 2.8) so the resumed task is not bound to a stale
+     credential; the new token's `task_id` matches the hibernation record so the OTel trace stays
+     continuous across the gap.
+  4. **Hydrates state:** replays the serialized memory pointers, restores the filesystem delta onto
+     the fresh sandbox, and resumes the agent loop *at the clarification prompt* with the human's
+     answer injected — not from scratch.
+  5. A `thaw` span is emitted (Phase 2.5) linking the pre-hibernation span subtree to the
+     post-hibernation continuation, so a paused-then-resumed task is one replayable trajectory,
+     not two.
+- **Stale-on-thaw detection.** Between freeze and thaw the workspace may have moved (another agent
+  edited a file the hibernated task held). On thaw, the Phase 5.5 drift check is re-run against
+  the concepts/paths the task was working on; if they drifted, the agent is handed the drift banner
+  *before* resuming so it does not act on stale state. This binds hibernation directly to the
+  drift-detection layer rather than leaving the resumed agent to discover staleness by failing.
+- **Forced hibernation cap.** A hibernated task is not kept forever: a max hibernation TTL (default
+  7 days, configurable in `Program.md`) after which the task is auto-cancelled, its
+  hibernation record archived, and the human is notified. This prevents an infinite backlog of
+  unanswered clarifications.
+
+**Why this matters:** this is what makes HITL pauses cheap (no compute burn, no leaked locks, no
+stale credentials) *and* lossless (full state restore, continuous trace). Without it, a long
+clarification pause is a slow resource leak; with it, a pause is a clean checkpoint.
+
+#### 6.7 Infrastructure crash reconciliation (orphaned-state cleanup)
+
+Phase 6.4 handles *logical* failures via automated rollback and Phase 6.6 handles *human* pauses
+via hibernation, but neither covers **host infrastructure crashes**: an OS reboot, a FastAPI
+Context Server crash, or a power loss mid-execution. After an ungraceful shutdown the OS is left
+with **orphaned state**: Phase 0.5 sandboxes may linger as zombie microVMs/processes, Phase 2.6
+lock leases may be stuck `held` with no live agent to release them (TTL will eventually clear them,
+but the window is a deadlock window), Phase 3.3 delegated child tasks leave their OTel span
+subtrees (Phase 2.5) perpetually `open`, and `PLAN.md` tasks remain `in_progress` forever. A
+clean cold-start must reconcile this before accepting new work.
+
+- **Startup reconciliation hook.** On boot, before the Context Server serves any agent request, it
+  runs a reconciliation pass:
+  1. **Orphaned sandbox sweep.** Query the host (microVM control plane / process list / container
+     runtime) for any sandbox whose `task_id` is not present in the active-connections table, and
+     terminate them. Each kill is logged with the orphaned `task_id` so the human can see what was
+     reaped.
+  2. **Stale-lock clearance.** Clear all lock-lease entries whose owning `(agent, task_id)` is not
+     backed by a live connection — *not* by waiting for TTL, but immediately, marking them
+     `released:crash_recovery` in the append-only lock table (Phase 2.6) so the distinction between
+     a clean release, a hibernation release, and a crash recovery is auditable.
+  3. **Open-span closure.** For every task whose span tree is still `open` and whose owning
+     connection is gone, emit a terminal `crash_recovery` span (Phase 2.5) closing the subtree,
+     with the failure class `infrastructure_crash`, so traces are not left dangling and the
+     Phase 8 Dream Cycle clustering has complete trajectories to learn from.
+  4. **Task-state finalization.** Mark every `in_progress` `PLAN.md` task not backed by a live
+     connection as `failed:infrastructure_crash`, append a corresponding entry to `IMPLEMENT.md`
+     (with the last-known span id for replay), and trigger a Phase 6.4 rollback to the task's
+     pre-execution snapshot so the workspace is not left in a half-applied state.
+  5. **Hibernation-record integrity check.** Verify the Phase 6.6 hibernation store is intact
+     (no partial writes from the crash); corrupted records are quarantined and surfaced in the
+     Phase 7 evening review rather than silently loaded on the next thaw.
+- **Idempotency.** The reconciliation pass is idempotent — running it twice yields the same state
+  — so a crash during recovery itself is safe (the next boot re-runs it cleanly).
+- **Crash root-cause capture.** Where the host exposes it (e.g. systemd journal, container exit
+  code, FastAPI startup error), the reconciliation hook captures the crash cause into the first
+  `IMPLEMENT.md` entry after boot, closing the loop between "the OS restarted" and "why."
+- **Interaction with quota (Phase 2.11).** Reaped tasks' compute spend up to the crash instant is
+  still attributed to their `task_id` in the Phase 7.3 token ledger — crash recovery does not lose
+  accounting, so CAPO (Phase 7.4) correctly counts a crashed task as a rejected outcome.
+
+**Why this matters:** without crash reconciliation, every unexpected restart leaves a residue of
+zombie processes, deadlocked locks, and ghost tasks that compounds over time — the OS degrades
+silently until a human notices. With it, a crash is a single recoverable event, not a permanent
+scar.
+
 **Definition of Done (Phase 6):**
 - [ ] `contracts/permission_matrix.md` exists with the (agent × target) write table **and** the
   combinatorial lethal-trifecta rule + instruction-provenance rule.
@@ -779,6 +1262,23 @@ by Phase 7's purely-asynchronous daily flow.
 - [ ] A synthetic task shows the LLM-as-judge rubric producing a score that lands in
   `IMPLEMENT.md`.
 - [ ] A synthetic ambiguous task shows `request_clarification` pausing the loop and resuming.
+- [ ] `contracts/hibernation.md` documents the freeze/thaw steps, lock-release-as-hibernation,
+  token re-issue, stale-on-thaw drift re-check, and max hibernation TTL (Phase 6.6).
+- [ ] A proof-of-concept shows a task freezing (sandbox terminated, locks released, token revoked,
+  state serialized), waiting past the lock TTL, then thawing into a fresh sandbox with state
+  restored, locks re-acquired, and the OTel trace spanning the gap.
+- [ ] A proof-of-concept shows a thaw correctly blocking (not overwriting) when a released lock
+  is now held by another agent, and a thaw correctly surfacing the drift banner when the
+  workspace moved during hibernation.
+- [ ] `contracts/crash_recovery.md` documents the startup reconciliation hook: orphaned-sandbox
+  sweep, stale-lock clearance as `released:crash_recovery`, open-span closure as
+  `infrastructure_crash`, task-state finalization + rollback, hibernation-record integrity check,
+  idempotency, and crash root-cause capture (Phase 6.7).
+- [ ] A proof-of-concept shows a simulated crash (kill the Context Server mid-task) followed by a
+  reboot that reaps the orphaned sandbox, clears the stale lock immediately (not via TTL), closes
+  the open span as `infrastructure_crash`, marks the `PLAN.md` task `failed:infrastructure_crash`,
+  rolls back to the pre-task snapshot, and leaves the OS in a clean state on a second reboot
+  (idempotency).
 
 ---
 
@@ -891,6 +1391,11 @@ between sessions, not rely on humans noticing patterns.
   they are not re-proposed.
 - The Dream Cycle output also seeds the meta-agent's default-improvement proposals, closing the
   loop between observability (Phase 2.5), drift (Phase 5.5), and self-improvement.
+- **Vector re-normalization pass.** The Dream Cycle evening window is also when any
+  `semantic_drift_detected` flags (Phase 5.5) are serviced: a background re-embedding pass
+  re-normalizes the vector space globally, then clears the flag. Because it runs offline and
+  asynchronously, agents are never blocked by a full vector rebuild during working hours — the
+  semantic layer self-heals nightly.
 
 #### 8.3 Removal conditions audit
 
@@ -955,6 +1460,19 @@ Phase 8  Meta-harness (self-improve)        ─┘  Closure
 | Loss of original objective due to context rot             | 5     | Automatic compactor summarizes older history past a token threshold (Phase 5.4). |
 | Tool schemas bloat system prompt across all agents        | 2,5   | Progressive tool disclosure: only `search_tools` + on-demand schema load (Phase 5.6). |
 | No trajectory visibility → failure cause is guesswork     | 2     | OTel/Langfuse span per tool call + task; failure-class tags (Phase 2.5). |
+| Agent spoofs another agent's identity in the tool payload (prompt injection) to escalate writes | 2,6 | Zero-trust identity enforced at transport layer; payload identity ignored; mismatch logged as `identity_spoof_attempt` (Phase 2.8). |
+| Agent stuck in a tight logic loop (identical repeated tool calls) burns turns, spams the Context Server, inflates the token DB | 2,6,7 | Server-side circuit breaker trips on N identical `(tool, args-hash)` calls; auto-escalates to HITL (Phase 2.9). |
+| Cross-agent delegation via native sub-agent protocols is invisible to the OS (untraced, ungated, unrecorded) | 2,3,6 | `delegate_task` tool routes all delegation through the control plane: traced, permission-narrowed, plan-recorded, depth-capped (Phase 3.3). |
+| Long HITL clarification pause leaks compute (idle sandbox), deadlocks locks, or loses state on sandbox timeout | 0.5,2.6,2.8,6 | Hibernation protocol: freeze serializes state + releases locks + revokes token + terminates sandbox; thaw provisions fresh sandbox + re-acquires locks + re-issues token + restores state; stale-on-thaw drift re-check (Phase 6.6). |
+| Lost update across turns: agent writes based on a stale read, silently overwriting another agent's change despite holding the write lock | 2,6 | Optimistic concurrency control: version hash on every read, `expected_version` required on write, `state_changed` rejection forces re-read; append-only ledgers use position-check (Phase 2.10). |
+| Agent bursts many *distinct* expensive calls (evades the identical-args circuit breaker) and overwhelms the local LLM runner or exhausts the API budget | 2,7 | Token-bucket rate limiter per `(agent, task_id)` with per-tool cost weighting + `429`/`Retry-After`; per-task compute-quota ceiling auto-hibernates on exhaustion (Phase 2.11). |
+| Secret/PII pasted into Obsidian or hallucinated by the LLM is immortalized in OTel traces, `IMPLEMENT.md`, and OKF bundles | 1,2,4 | DLP middleware: high-entropy regex scrubber redacts to `[REDACTED:...]` at read edge, write edge, and export hook; redaction events traced; secrets-bridge coordination raises rotation alerts (Phase 2.12). |
+| Host crash / reboot leaves orphaned sandboxes, stuck lock leases, perpetually-open OTel spans, and ghost `in_progress` tasks that compound over time | 0.5,2.5,2.6,3.3,6 | Startup reconciliation hook: reap orphaned sandboxes, clear stale locks as `released:crash_recovery`, close open spans as `infrastructure_crash`, finalize tasks `failed:infrastructure_crash` + rollback, idempotent (Phase 6.7). |
+| Full re-index on every save bottlenecks the secondary brain at scale (50k+ files), locking context for minutes | 2.3,4,5 | Incremental delta indexing: export hook + indexer emit per-change node/edge patches; full rebuild remains a repair command; short lock windows; drift detection runs per-delta (Phase 5.7). |
+| Multi-agent lock cycle (dining-philosophers via `delegate_task` + `acquire_lock`) stalls execution until TTL breaks it, inflating CAPO with useless retries | 2.6,3.3 | Server-side task-dependency DAG deadlock detector: cyclic edge refused with `deadlock_risk` *before* the wait forms; agent yields/aborts/hibernates instead of stalling (Phase 2.6). |
+| Wall-clock drift across hybrid sandboxes (remote E2B vs. local host) breaks OTel span nesting and rejects valid tokens during thaw | 2.5,2.8,6.6 | Logical monotonic sequence counters (Lamport timestamps) issued by the server for span ordering and token expiry; wall-clock kept as hint only (Phase 2.5 / 2.8). |
+| Incremental vector injections silently shift cluster centroids → localized "context blindness" with no code-level signal | 2.3,5,8 | Embedding-Density-Variance drift monitor flags `semantic_drift_detected`; offline asynchronous re-normalization runs in the Dream Cycle evening window without locking agents (Phase 5.5 / 8.2.1). |
+| Adversarial read loop from untrusted source (unique high-entropy read calls) evades breaker + limiter, floods traces/logs and blinds human review (denial-of-context) | 2.5,2.9,2.11,6.2 | Read-edge context chaperoning: untrusted-provenance read branch isolates telemetry, collapses reads into one macro-span with sampled args, compactor skips it, limiter-trip auto-escalates HITL (Phase 2.13 / 6.2). |
 
 ---
 
@@ -969,6 +1487,37 @@ Phase 8  Meta-harness (self-improve)        ─┘  Closure
 - [ ] Lock manager backing store: in-process SQLite vs. external (Redis/etcd) once multi-host is in scope.
 - [ ] Secrets store: OS keychain (single-host) vs. cloud SM (multi-host) — Phase 2.7 decision point.
 - [ ] Drift threshold calibration — start conservative; tune from Phase 2.5 trace stats after N weeks.
+- [ ] Identity token signing key custody — single shared HMAC key (single-host) vs. per-agent
+  asymmetric keys (multi-host). Phase 2.8 decision point; ties into the Phase 2.7 secrets store.
+- [ ] Circuit-breaker trip defaults (N / window) — start at N=3, window=60s; tune from Phase 2.5
+  args-hash replay stats to avoid false-positives on legitimate retry-with-backoff.
+- [ ] Delegation recursion depth cap — default 3; confirm against real opencode↔claude-code
+  handoffs once Phase 3.3 ships.
+- [ ] Hibernation record store — durable local SQLite (single-host) vs. external store once
+  multi-host is in scope; max hibernation TTL default 7 days, tunable in `Program.md`.
+- [ ] OCC version-hash source — git blob SHA (tracked files) vs. xxhash (untracked ledgers); confirm
+  the append-only position-check vs. full-content-hash boundary per resource type (Phase 2.10).
+- [ ] Rate-limit + quota defaults — RPM and per-tool cost weights per adapter; tune from Phase 7.3
+  token stats after N weeks so legitimate exploration is not false-throttled (Phase 2.11).
+- [ ] DLP pattern set custody — who maintains the secret/PII regex catalogue; start with AWS /
+  Stripe / GitHub / Slack + email/phone/CC; add project-specific patterns via `AGENTS.md`
+  (Phase 2.12).
+- [ ] Crash-recovery crash-cause sources — which host signals (systemd journal, container exit
+  code, FastAPI startup error) to capture into `IMPLEMENT.md` per supported sandbox technology
+  (Phase 6.7, ties to the Phase 0.5 sandbox pick).
+- [ ] Delta-indexing degradation threshold — how many deltas before a from-scratch reindex is
+  forced to bound drift between the patched graph and a clean rebuild (Phase 5.7).
+- [ ] DAG deadlock-detector cycle-detection strategy — incremental reachability vs. union-find;
+  confirm O(V+E) per request holds at the expected live-task fan-out from Phase 3.3 delegation
+  (Phase 2.6).
+- [ ] Lamport logical-clock bootstrap — single primary server (single-host) vs. distributed
+  sequence service (multi-host); how a server failover re-synchronizes the counter with the
+  Phase 6.7 crash-reconciliation hook (Phase 2.5 / 2.8).
+- [ ] Embedding-Density-Variance threshold — start conservative; tune from Phase 2.5 read-stats
+  after N weeks so legitimate feature growth does not false-trigger re-normalization (Phase 5.5).
+- [ ] Chaperon macro-span sample retention — how many arg samples to keep per collapsed branch so
+  forensics stays possible without re-introducing the trace flood the chaperon prevents
+  (Phase 2.13).
 
 ---
 
@@ -990,6 +1539,19 @@ Cross-reference of every gap surfaced in the harness-engineering audit to the ph
 - [x] Phase 6: real-time HITL handoff (`request_clarification`) → Phase 6.5.
 - [x] Phase 7: FinOps upgrade to CAPO → Phase 7.4.
 - [x] Phase 8: Dream Cycle for proactive semantic-memory extraction → Phase 8.2.1.
+- [x] Phase 2: zero-trust identity enforced at transport layer (signed token, payload identity ignored) → Phase 2.8.
+- [x] Phase 2: server-side circuit breaker on identical repeated tool calls (auto-HITL escalation) → Phase 2.9.
+- [x] Phase 3: standardized inter-agent delegation contract (`delegate_task`, traced + plan-recorded + permission-narrowed) → Phase 3.3.
+- [x] Phase 6: hibernation protocol for long HITL pauses (freeze/thaw, lock release + re-acquire, token rotation, stale-on-thaw drift re-check) → Phase 6.6.
+- [x] Phase 2: optimistic concurrency control (version-hash on read, `expected_version` on write, `state_changed` rejection) → Phase 2.10.
+- [x] Phase 2: token-bucket rate limiter + per-task compute quota (throttle distinct-call bursts, auto-hibernate on quota exhaustion) → Phase 2.11.
+- [x] Phase 2: DLP middleware (regex scrubber redacts secrets/PII at read + write + export edges; redaction events traced; secrets-bridge rotation alerts) → Phase 2.12.
+- [x] Phase 5: incremental delta indexing (per-change node/edge patches, short lock windows, full rebuild as repair command, per-delta drift detection) → Phase 5.7.
+- [x] Phase 6: startup crash-reconciliation hook (reap orphaned sandboxes, clear stale locks, close open spans as `infrastructure_crash`, finalize + rollback ghost tasks, idempotent) → Phase 6.7.
+- [x] Phase 2: DAG deadlock detector on the lock manager (cyclic `acquire_lock`/`delegate_task` edges refused with `deadlock_risk` before the wait forms) → Phase 2.6.
+- [x] Phase 2: logical monotonic sequence counters (Lamport timestamps) decouple OTel span ordering + identity-token expiry from host wall-clock across hybrid sandboxes → Phase 2.5 / 2.8.
+- [x] Phase 5 / 8: vector-space centroid-shift drift detection (`semantic_drift_detected` via Embedding-Density-Variance) + asynchronous Dream-Cycle re-normalization → Phase 5.5 / 8.2.1.
+- [x] Phase 2 / 6: read-edge context chaperoning (untrusted-provenance read branch, macro-span collapsing, compactor skip, limiter-coupled HITL) defeats denial-of-context read loops → Phase 2.13 / 6.2.
 
 ---
 
@@ -1014,11 +1576,21 @@ Cross-reference of every gap surfaced in the harness-engineering audit to the ph
 
 ---
 
-*Plan version: 1.1 — generated from the indexed knowledge graph of this repo
+*Plan version: 1.4 — generated from the indexed knowledge graph of this repo
 (1,684 nodes / 3,173 edges) plus the OKF v0.1 spec, the awesome-harness-engineering templates,
 and the Obsidian vault structure at `D:\ObsidianVaults\Main Brain\`. `obsidianData` at
-`D:\obsidianData` is treated as vault plumbing, not a knowledge surface. v1.1 incorporates the
+`D:\obsidianData` is treated as vault plumbing, not a knowledge surface. v1.1 incorporated the
 harness-engineering audit: compute-plane sandbox (Phase 0.5), trajectory tracing (2.5), lock
 manager (2.6), secrets bridge (2.7), progressive tool disclosure + compaction + drift detection
 (5.4–5.6), combinatorial risk + LLM-as-judge gate + checkpoint/rollback + HITL (6.2–6.5), CAPO
-FinOps (7.4), and the Dream Cycle (8.2.1).*
+FinOps (7.4), and the Dream Cycle (8.2.1). v1.2 incorporated the v1.1 stress-test audit:
+zero-trust transport-layer identity (2.8), server-side circuit breaker (2.9), inter-agent
+delegation contract (3.3), and the hibernation protocol for long HITL pauses (6.6). v1.3
+incorporated the distributed-systems edge-case audit: optimistic concurrency control against
+lost-update across turns (2.10), token-bucket rate limiting + compute quota (2.11), DLP/trace
+sanitization middleware (2.12), incremental delta indexing for scale (5.7), and the startup
+crash-reconciliation hook for orphaned state (6.7). v1.4 incorporates the deep production audit:
+DAG deadlock detector on the lock manager (2.6), Lamport logical-sequence counters for
+clock-drift-safe telemetry + token expiry (2.5 / 2.8), vector-space centroid-shift drift
+detection with asynchronous Dream-Cycle re-normalization (5.5 / 8.2.1), and read-edge context
+chaperoning against denial-of-context read loops (2.13 / 6.2).*

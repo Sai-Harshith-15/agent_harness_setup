@@ -4,11 +4,11 @@ from pydantic import BaseModel
 import uvicorn
 import asyncio
 import os
+import re
 from .config import settings
-from .db import init_db, audit, connect, CONTROL_DB, TOKEN_DB
+from .db import init_db, audit, connect, CONTROL_DB
 from .identity import require_identity, AgentIdentity
 from .obsidian_backend import backend
-from .lock_manager import LockManager
 from .middlewares import PolicyMiddleware, DLPFilter
 from .registry import load_agents, lookup_agent, find_capability, orchestrator_id
 from .delegation import delegate_task as _delegate_task
@@ -18,7 +18,17 @@ from .indexing.compactor import compact
 from .indexing.drift import detect_drift
 from .indexing.headroom import Headroom
 from .indexing.watcher import watch_and_index
-
+from .governance.permissions import can_write
+from .governance.locks import acquire_lock, release_lock, check_occ
+from .governance.hibernation import hibernate, thaw
+from .governance.hitl import init_hitl, enqueue, open_items, resolve
+from .governance.reconcile import reconcile
+from .finops.rollups import totals_by_task, heatmap, capo, capo_trend
+from .finops.standup import post_standup
+from .finops.meter import mark_accepted
+from .meta.runner import run_dream_cycle
+from .meta.dream_cycle import analyze
+from datetime import datetime, time, timedelta
 # Simple in-memory event bus for websocket
 dashboard_clients = set()
 
@@ -26,7 +36,7 @@ async def broadcast_event(event_data: dict):
     for client in list(dashboard_clients):
         try:
             await client.send_json(event_data)
-        except:
+        except Exception:
             dashboard_clients.discard(client)
 
 def notify_audit(agent, task_id, tool, ok, detail):
@@ -35,9 +45,37 @@ def notify_audit(agent, task_id, tool, ok, detail):
         "type": "audit", "agent": agent, "task_id": task_id, "tool": tool, "ok": ok, "detail": detail
     }))
 
+async def _daily_standup_loop():
+    while True:
+        now = datetime.now()
+        target = datetime.combine(now.date(), time(9, 0))   # 9am local
+        if now >= target:
+            target += timedelta(days=1)
+        await asyncio.sleep((target - now).total_seconds())
+        try:
+            await post_standup()
+        except Exception as e:
+            print("[standup] failed:", e)
+
+async def _dream_loop():
+    while True:
+        now = datetime.now()
+        target = datetime.combine(now.date(), time(3, 0))   # 3am local
+        if now >= target:
+            target += timedelta(days=1)
+        await asyncio.sleep((target - now).total_seconds())
+        try:
+            print("[dream-cycle]", await run_dream_cycle())
+        except Exception as e:
+            print("[dream-cycle] failed:", e)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    init_hitl()
+    print("[boot] crash reconciliation:", reconcile())   # reap crash-orphaned leases
+    asyncio.create_task(_daily_standup_loop())
+    asyncio.create_task(_dream_loop())
     # ENABLE_WATCHER defaults to true; tests set it to 'false' so the
     # background file-watcher never starts and can never block teardown.
     if os.environ.get("ENABLE_WATCHER", "true").lower() not in ("0", "false", "no"):
@@ -96,16 +134,27 @@ async def dashboard_events(websocket: WebSocket):
     try:
         while True:
             await websocket.receive_text()
-    except:
+    except Exception:
         dashboard_clients.discard(websocket)
 
 # ---------- MCP tool surface (identity-bound) ----------
 class SearchBody(BaseModel):
     query: str
 
-class AppendBody(BaseModel):
+class GovernedAppendBody(BaseModel):
     path: str
+    target: str          # heading name, must be in the allow-list
     content: str
+    expected_version: str | None = None   # OCC token from read_note
+
+class ClarifyBody(BaseModel):
+    question: str
+    proposed_diff: dict | None = None
+
+class ResolveBody(BaseModel):
+    item_id: int
+    status: str          # approved | modified | rejected
+    resolution: str
 
 class DelegateBody(BaseModel):
     target_agent: str
@@ -153,18 +202,28 @@ async def read_note(path: str, ident: AgentIdentity = Depends(require_identity))
         raise HTTPException(status_code=502, detail="Obsidian backend error")
 
 @app.post("/mcp/append_implement")
-async def append_implement(body: AppendBody, ident: AgentIdentity = Depends(require_identity)):
-    LockManager.acquire(resource=body.path, agent=ident.agent, task_id=ident.task_id)
+async def append_implement(body: GovernedAppendBody, ident: AgentIdentity = Depends(require_identity)):
+    decision = can_write(body.path, "heading", body.target)   # permission matrix
+    if not decision.allowed:
+        notify_audit(ident.agent, ident.task_id, "append_implement", False, f"DENY: {decision.reason}")
+        raise HTTPException(status_code=403, detail=decision.reason)
+
+    acquire_lock(body.path, ident.agent, ident.task_id)       # lease
     try:
+        note = await backend.read_note(body.path)             # OCC read
+        check_occ(str(note.get("stat", {}).get("mtime", "")), body.expected_version)
         scrubbed_content = DLPFilter.scrub(body.content)
-        await backend.append(body.path, scrubbed_content)
-        notify_audit(ident.agent, ident.task_id, "append_implement", True, body.path)
+        await backend.patch(body.path, "heading", body.target, scrubbed_content,
+                            reject_if_preexists=True)         # idempotent write
+        notify_audit(ident.agent, ident.task_id, "append_implement", True, f"{body.path}#{body.target}")
         return {"ok": True}
+    except HTTPException:
+        raise
     except Exception as e:
         notify_audit(ident.agent, ident.task_id, "append_implement", False, str(e))
         raise HTTPException(status_code=502, detail="Obsidian backend error")
     finally:
-        LockManager.release(resource=body.path, task_id=ident.task_id)
+        release_lock(body.path, ident.task_id)
 
 @app.post("/mcp/delegate_task")
 async def delegate_task_ep(body: DelegateBody, ident: AgentIdentity = Depends(require_identity)):
@@ -176,10 +235,61 @@ async def delegate_task_ep(body: DelegateBody, ident: AgentIdentity = Depends(re
 async def accept_implement(body: AcceptBody, ident: AgentIdentity = Depends(require_identity)):
     if ident.agent != orchestrator_id():
         raise HTTPException(status_code=403, detail="Only the orchestrator may accept IMPLEMENT rows")
-    with connect(TOKEN_DB) as c:
-        c.execute("UPDATE token_ledger SET accepted=1 WHERE task_id=?", (body.row_id,))
-    audit(ident.agent, ident.task_id, "accept_implement", True, f"{body.path}#{body.row_id}")
+    mark_accepted(body.row_id)
+    notify_audit(ident.agent, ident.task_id, "accept_implement", True, f"{body.path}#{body.row_id}")
     return {"ok": True, "accepted": body.row_id}
+
+@app.post("/mcp/request_clarification")
+async def request_clarification(body: ClarifyBody, ident: AgentIdentity = Depends(require_identity)):
+    hibernate(ident.task_id, ident.agent, reason="awaiting-hitl",
+              frozen_state={"question": body.question, "diff": body.proposed_diff})
+    item_id = enqueue(ident.task_id, ident.agent, body.question, body.proposed_diff)
+    notify_audit(ident.agent, ident.task_id, "request_clarification", True, f"queued #{item_id}")
+    return {"paused": True, "hitl_item": item_id}
+
+@app.get("/dashboard/hitl")
+async def dashboard_hitl():
+    return {"open": open_items()}
+
+@app.patch("/dashboard/hitl")
+async def resolve_hitl(body: ResolveBody):
+    resolve(body.item_id, body.status, body.resolution)
+    if body.status in ("approved", "modified"):
+        with connect(CONTROL_DB) as c:
+            row = c.execute("SELECT task_id FROM hitl_queue WHERE id=?", (body.item_id,)).fetchone()
+        if row:
+            thaw(row["task_id"])
+    return {"ok": True, "status": body.status}
+
+@app.get("/dashboard/crashes")
+async def dashboard_crashes():
+    return reconcile()
+
+# ---------- Phase 7: FinOps ----------
+
+@app.get("/dashboard/tokens")
+async def dashboard_tokens():
+    return {"by_task": totals_by_task(), "heatmap": heatmap()}
+
+@app.get("/dashboard/capo")
+async def dashboard_capo():
+    return {"summary": capo(), "trend": capo_trend()}
+
+@app.post("/mcp/post_standup")
+async def post_standup_ep(ident: AgentIdentity = Depends(require_identity)):
+    result = await post_standup()
+    audit(ident.agent, ident.task_id, "post_standup", True, result["path"])
+    return result
+
+@app.websocket("/dashboard/tokens/ws")
+async def tokens_ws(ws: WebSocket):
+    await ws.accept()
+    try:
+        while True:
+            await ws.send_json({"by_task": totals_by_task(), "capo": capo()})
+            await asyncio.sleep(3)
+    except Exception:
+        await ws.close()
 
 # ---------- Phase 5: indexing + generation endpoints ----------
 
@@ -212,6 +322,45 @@ async def dashboard_drift():
 async def dashboard_headroom(used: int = 0, incoming: int = 0):
     h = Headroom()
     return {"remaining": h.remaining(used), "must_compact": h.must_compact(used, incoming)}
+
+# ---------- Phase 9: Kanban PLAN.md parsing ----------
+
+_PLAN_ROW = re.compile(
+    r"- \[(?P<status>[^\]]+)\] \((?P<id>[^)]+)\) (?P<title>.+?) \| agent=(?P<agent>\S+)"
+    r"(?: capo=(?P<capo>\d+))?(?: tokens=(?P<tokens>\d+))?"
+)
+
+@app.get("/dashboard/plan")
+async def dashboard_plan():
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    path = os.path.join(root, "PLAN.md")
+    rows = []
+    if os.path.exists(path):
+        for line in open(path, encoding="utf-8"):
+            m = _PLAN_ROW.match(line.strip())
+            if m:
+                d = m.groupdict()
+                rows.append({"status": d["status"], "id": d["id"], "title": d["title"],
+                             "agent": d["agent"], "capo": int(d["capo"] or 0), "tokens": int(d["tokens"] or 0)})
+    return {"rows": rows}
+
+# ---------- Phase 8: Meta-harness & Dream Cycle ----------
+
+@app.get("/dashboard/dream")
+async def dashboard_dream():
+    # Preview proposals WITHOUT writing (for the UI 'dry run' button).
+    return {"proposals": analyze()}
+
+
+@app.post("/mcp/run_dream_cycle")
+async def run_dream_cycle_ep(ident: AgentIdentity = Depends(require_identity)):
+    # Only meta or the orchestrator may trigger it.
+    if ident.agent not in ("meta", "opencode"):
+        raise HTTPException(status_code=403, detail="Only meta or opencode may run the Dream Cycle")
+    result = await run_dream_cycle()
+    audit(ident.agent, ident.task_id, "run_dream_cycle", result["ok"],
+          f"{len(result.get('proposals', []))} proposals")
+    return result
 
 
 if __name__ == "__main__":

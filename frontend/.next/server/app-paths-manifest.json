@@ -1,0 +1,11 @@
+{
+  "/_not-found/page": "app/_not-found/page.js",
+  "/agents/page": "app/agents/page.js",
+  "/crash/page": "app/crash/page.js",
+  "/hitl/page": "app/hitl/page.js",
+  "/task/[id]/page": "app/task/[id]/page.js",
+  "/tokens/page": "app/tokens/page.js",
+  "/kanban/page": "app/kanban/page.js",
+  "/page": "app/page.js",
+  "/vault/page": "app/vault/page.js"
+}
