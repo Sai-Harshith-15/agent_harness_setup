@@ -17,7 +17,7 @@ def test_phase6_out_of_matrix_write_denied(client):
     res = client.post(
         "/mcp/append_implement",
         json={"path": "People/Alice.md", "target": "Notes", "content": "nope"},
-        headers={"X-Agent-Identity": "hermes:task-6"}
+        headers={"X-Agent-Identity": "hermes:task-6:cababbc77d7b77c66d010f147df06c57ba005b403895166ba8cb3d9006f5893a"}
     )
     assert res.status_code == 403
     assert "is not an agent-writable log target" in res.json()["detail"]
@@ -43,7 +43,7 @@ def test_phase6_allowed_write_succeeds(client, monkeypatch):
     res = client.post(
         "/mcp/append_implement",
         json={"path": "okf/log.md", "target": "Agent Updates", "content": "- did the thing", "expected_version": "2026-07-08T00:00:00"},
-        headers={"X-Agent-Identity": "opencode:task-6"}
+        headers={"X-Agent-Identity": "opencode:task-6:9b9f441bdd1578ac0104b0589073d38a666c76130b9430f173d9b919623a8ae5"}
     )
     assert res.status_code == 200
     assert res.json()["ok"] is True
@@ -57,7 +57,7 @@ def test_phase6_lock_contention(client):
     res = client.post(
         "/mcp/append_implement",
         json={"path": "okf/log.md", "target": "Agent Updates", "content": "- did the thing"},
-        headers={"X-Agent-Identity": "opencode:task-6"}
+        headers={"X-Agent-Identity": "opencode:task-6:9b9f441bdd1578ac0104b0589073d38a666c76130b9430f173d9b919623a8ae5"}
     )
     assert res.status_code == 409
     assert "resource locked by hermes:task-99" in res.json()["detail"]
@@ -68,7 +68,7 @@ def test_phase6_hitl_pause_and_resolve(client):
     res = client.post(
         "/mcp/request_clarification",
         json={"question": "overwrite config?", "proposed_diff": {"path": "x", "before": "a", "after": "b"}},
-        headers={"X-Agent-Identity": "codex:task-99"}
+        headers={"X-Agent-Identity": "codex:task-99:982a73795578386cabc3eca10f1684f3218f4c5220345a09e32b9af877745c22"}
     )
     assert res.status_code == 200
     data = res.json()

@@ -30,7 +30,7 @@ def client(isolate_hooks):
         yield c
 
 
-AGENT_HDR = {"X-Agent-Identity": "opencode:task-5"}
+AGENT_HDR = {"X-Agent-Identity": "opencode:task-5:cafcf1f5e41e92278232127fc77d69215b9161eb43e65b2d0e459e0158a9c731"}
 
 
 # ---------------------------------------------------------------------------

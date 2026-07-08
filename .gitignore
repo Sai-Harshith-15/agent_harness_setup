@@ -43,3 +43,4 @@ hooks/
 .ruff_cache/
 .venv/
 venv/
+tools/

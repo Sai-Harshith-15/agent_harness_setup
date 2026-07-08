@@ -50,14 +50,14 @@ def test_phase8_endpoints(client, monkeypatch):
     assert len(res.json()["proposals"]) == 1
     
     # Deny non-meta/non-opencode
-    res = client.post("/mcp/run_dream_cycle", headers={"X-Agent-Identity": "codex:task-1"})
+    res = client.post("/mcp/run_dream_cycle", headers={"X-Agent-Identity": "codex:task-1:109c953a2ab259bc26e615ab770c938885dc9561455a7926d73665d61904b0c3"})
     assert res.status_code == 403
     
     async def mock_run_dream_cycle():
         return {"ok": True, "proposals": [{"kind": "test"}], "written_to": "okf/log.md"}
     monkeypatch.setattr(main_app, "run_dream_cycle", mock_run_dream_cycle)
     
-    res = client.post("/mcp/run_dream_cycle", headers={"X-Agent-Identity": "meta:dream-1"})
+    res = client.post("/mcp/run_dream_cycle", headers={"X-Agent-Identity": "meta:dream-1:96be4d4d6c684ac6b0580fbb730a9e46e4e8bce2611825baa4abac4a504e45c4"})
     assert res.status_code == 200
     assert res.json()["ok"] is True
     assert len(res.json()["proposals"]) == 1

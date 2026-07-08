@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     context_server_host: str = "127.0.0.1"
     context_server_port: int = 27180
     hooks_dir: str = "../hooks"
+    identity_secret: str = "default-insecure-secret"
 
 
 settings = Settings()

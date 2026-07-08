@@ -15,6 +15,9 @@
 | 4 | P4-2 | /dashboard/vault browse endpoint wired | opencode | true | 2026-07-08 |
 | 5 | P5-1 | 24/24 tests green; reindex delta-aware; compact respects budget; graph+drift+headroom endpoints live; ruff clean | antigravity | false | 2026-07-08 |
 | 6 | P6-1 | 5/5 tests green; permissions matrix, OCC locks, hitl queue, hibernation, and crash reconciliation wired | antigravity | false | 2026-07-08 |
+| 7 | P7-1 | FinOps metering, rollups, and standup wired | antigravity | false | 2026-07-08 |
+| 8 | P8-1 | Dream Cycle analysis and nightly runner wired | antigravity | false | 2026-07-08 |
+| 9 | P9-1 | Mission Control Next.js frontend pages and dashboard/plan parser | antigravity | false | 2026-07-08 |
 
 ---
 

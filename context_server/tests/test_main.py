@@ -34,5 +34,5 @@ def test_identity_rejected():
 
 def test_identity_accepted():
     with TestClient(app) as client:
-        response = client.post("/mcp/search_notes", json={"query": "hello"}, headers={"X-Agent-Identity": "opencode:task-123"})
+        response = client.post("/mcp/search_notes", json={"query": "hello"}, headers={"X-Agent-Identity": "opencode:task-123:86f24b46f9aeeaff3bd79de5548999585a71532c939985baca78afaf25cc6a71"})
         assert response.status_code in [200, 502]

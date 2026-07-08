@@ -6,5 +6,4 @@ pydantic-settings==2.5.2
 python-dotenv==1.0.1
 mcp
 pyyaml==6.0.2
-networkx==3.3
 watchfiles==0.24.0

@@ -26,14 +26,14 @@
 - [done] (P5-1) Indexing + generation | agent=antigravity capo=0 tokens=0
 
 ## Phase 6 — Verification, permissions, HITL, hibernation & crash reconciliation
-- [backlog] (P6-1) Permission matrix + HITL gate | agent=opencode capo=0 tokens=0
-- [backlog] (P6-2) Hibernation + crash reconciliation | agent=opencode capo=0 tokens=0
+- [done] (P6-1) Permission matrix + HITL gate | agent=opencode capo=0 tokens=0
+- [done] (P6-2) Hibernation + crash reconciliation | agent=opencode capo=0 tokens=0
 
 ## Phase 7 — Daily ops & cost discipline (CAPO)
-- [backlog] (P7-1) CAPO cost controller | agent=opencode capo=0 tokens=0
+- [done] (P7-1) CAPO cost controller | agent=opencode capo=0 tokens=0
 
 ## Phase 8 — Meta-harness & Dream Cycle
-- [backlog] (P8-1) Meta-harness loop | agent=opencode capo=0 tokens=0
+- [done] (P8-1) Meta-harness loop | agent=opencode capo=0 tokens=0
 
 ## Phase 9 — Next.js Mission Control (full pages)
-- [backlog] (P9-1) Full Mission Control UI pages | agent=opencode capo=0 tokens=0
+- [done] (P9-1) Full Mission Control UI pages | agent=opencode capo=0 tokens=0

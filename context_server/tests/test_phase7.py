@@ -79,6 +79,6 @@ def test_phase7_finops_endpoints(client, monkeypatch):
         pass
     monkeypatch.setattr(backend, "patch", mock_patch)
     
-    res = client.post("/mcp/post_standup", headers={"X-Agent-Identity": "opencode:task-3"})
+    res = client.post("/mcp/post_standup", headers={"X-Agent-Identity": "opencode:task-3:623834a916491e667f9a8ef0ec361be33569f1c2786aa0691ed8c11cc375fdc7"})
     assert res.status_code == 200
     assert res.json()["posted"] is True
