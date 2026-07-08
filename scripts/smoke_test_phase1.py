@@ -7,16 +7,17 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../c
 
 from app.obsidian_backend import backend
 
+
 async def main():
     print("Running Phase 1 Smoke Test...")
     print("Testing Obsidian backend health...")
     is_healthy = await backend.health()
     print(f"Health: {'OK' if is_healthy else 'Degraded'}")
-    
+
     if not is_healthy:
         print("Backend not healthy, skipping search.")
         sys.exit(1)
-        
+
     print("Testing search_simple for 'hello'...")
     try:
         results = await backend.search_simple("hello")

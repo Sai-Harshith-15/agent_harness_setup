@@ -1,6 +1,8 @@
 import pytest
 from fastapi.testclient import TestClient
+
 from context_server.app.main import app
+
 
 @pytest.fixture
 def client():
@@ -15,48 +17,48 @@ def setup_data():
     pass
 
 def test_phase8_meta_analyze(monkeypatch):
-    from context_server.app.meta.dream_cycle import analyze
     import context_server.app.meta.dream_cycle as dream_cycle
-    
+    from context_server.app.meta.dream_cycle import analyze
+
     # mock drift
     monkeypatch.setattr(dream_cycle, "detect_drift", lambda: [{"spec": "Spec A", "changed_code": ["file_a.py"]}])
-    
+
     # mock capo
     monkeypatch.setattr(dream_cycle, "capo", lambda: {"capo": 6000, "total_tokens": 6000, "accepted_tasks": 1})
     monkeypatch.setattr(dream_cycle, "totals_by_task", lambda limit=1: [{"task_id": "task-expensive", "total_tokens": 6000, "accepted": 1}])
-    
+
     # mock denials
     monkeypatch.setattr(dream_cycle, "_recent_denials", lambda limit=50: [{"tool": "write", "detail": "DENY", "n": 4}])
-    
+
     proposals = analyze()
     assert len(proposals) == 3
-    
+
     drift_p = next(p for p in proposals if p["kind"] == "drift")
     assert "file_a.py" in drift_p["proposal"]
-    
+
     cost_p = next(p for p in proposals if p["kind"] == "cost")
     assert "task-expensive" in cost_p["proposal"]
-    
+
     rel_p = next(p for p in proposals if p["kind"] == "reliability")
     assert "write" in rel_p["proposal"]
 
 def test_phase8_endpoints(client, monkeypatch):
     import context_server.app.main as main_app
-    
+
     monkeypatch.setattr(main_app, "analyze", lambda: [{"kind": "test", "proposal": "test proposal", "evidence": {}}])
-    
+
     res = client.get("/dashboard/dream")
     assert res.status_code == 200
     assert len(res.json()["proposals"]) == 1
-    
+
     # Deny non-meta/non-opencode
     res = client.post("/mcp/run_dream_cycle", headers={"X-Agent-Identity": "codex:task-1:109c953a2ab259bc26e615ab770c938885dc9561455a7926d73665d61904b0c3"})
     assert res.status_code == 403
-    
+
     async def mock_run_dream_cycle():
         return {"ok": True, "proposals": [{"kind": "test"}], "written_to": "okf/log.md"}
     monkeypatch.setattr(main_app, "run_dream_cycle", mock_run_dream_cycle)
-    
+
     res = client.post("/mcp/run_dream_cycle", headers={"X-Agent-Identity": "meta:dream-1:96be4d4d6c684ac6b0580fbb730a9e46e4e8bce2611825baa4abac4a504e45c4"})
     assert res.status_code == 200
     assert res.json()["ok"] is True

@@ -6,7 +6,6 @@ hooks/ directory is never touched during CI.
 import pytest
 from fastapi.testclient import TestClient
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -45,14 +44,17 @@ class TestStore:
         assert len(content_hash("x")) == 16
 
     def test_needs_reindex_first_call(self, isolate_hooks):
-        from context_server.app.indexing.store import init_index, needs_reindex, content_hash
+        from context_server.app.indexing.store import content_hash, init_index, needs_reindex
         init_index()
         h = content_hash("data")
         assert needs_reindex("some/path.py", h) is True
 
     def test_needs_reindex_after_upsert(self, isolate_hooks):
         from context_server.app.indexing.store import (
-            init_index, needs_reindex, upsert_node, content_hash,
+            content_hash,
+            init_index,
+            needs_reindex,
+            upsert_node,
         )
         init_index()
         h = content_hash("data")
@@ -61,7 +63,10 @@ class TestStore:
 
     def test_needs_reindex_hash_change(self, isolate_hooks):
         from context_server.app.indexing.store import (
-            init_index, needs_reindex, upsert_node, content_hash,
+            content_hash,
+            init_index,
+            needs_reindex,
+            upsert_node,
         )
         init_index()
         h1 = content_hash("v1")
@@ -120,7 +125,7 @@ class TestGraphify:
 
 class TestCompactor:
     def _seed(self, isolate_hooks, n=5):
-        from context_server.app.indexing.store import init_index, upsert_node, content_hash
+        from context_server.app.indexing.store import content_hash, init_index, upsert_node
         init_index()
         for i in range(n):
             upsert_node(f"file{i}.py", "file", content_hash(f"v{i}"), 200, f"summary {i}")
@@ -134,8 +139,8 @@ class TestCompactor:
         assert result["span"]["budget"] == 400
 
     def test_compact_empty_store(self, isolate_hooks):
-        from context_server.app.indexing.store import init_index
         from context_server.app.indexing.compactor import compact
+        from context_server.app.indexing.store import init_index
         init_index()
         result = compact(budget_tokens=1000)
         assert result["kept"] == []
@@ -170,8 +175,8 @@ class TestHeadroom:
 
 class TestDrift:
     def test_detect_drift_returns_list(self, isolate_hooks):
-        from context_server.app.indexing.store import init_index
         from context_server.app.indexing.drift import detect_drift
+        from context_server.app.indexing.store import init_index
         init_index()
         result = detect_drift()
         assert isinstance(result, list)

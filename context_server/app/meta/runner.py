@@ -3,10 +3,10 @@
 Writes go to okf/log.md ('Agent Updates' heading) — the same permission-matrix-approved
 target every other agent uses. Never to Obsidian human notes.
 """
-from .dream_cycle import analyze, render_markdown
-from ..obsidian_backend import backend
-from ..governance.permissions import can_write
 from ..governance.locks import acquire_lock, release_lock
+from ..governance.permissions import can_write
+from ..obsidian_backend import backend
+from .dream_cycle import analyze, render_markdown
 
 OKF_LOG = "okf/log.md"
 HEADING = "Agent Updates"

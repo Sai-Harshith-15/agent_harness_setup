@@ -1,7 +1,7 @@
 """Token metering. Every tool call records a ledger row. accepted=1 is set later,
 only by the orchestrator via accept_implement (Phase 3), which is the CAPO numerator.
 """
-from ..db import connect, TOKEN_DB
+from ..db import TOKEN_DB, connect
 
 
 def record(agent: str, task_id: str, tool: str, tokens_in: int, tokens_out: int,

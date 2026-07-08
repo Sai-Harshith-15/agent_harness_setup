@@ -1,34 +1,37 @@
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, Depends, HTTPException, WebSocket
-from pydantic import BaseModel
-import uvicorn
 import asyncio
 import os
 import re
+from contextlib import asynccontextmanager
+from datetime import datetime, time, timedelta
+
+import uvicorn
+from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel
+
 from .config import settings
-from .db import init_db, audit, connect, CONTROL_DB
-from .identity import require_identity, AgentIdentity
-from .obsidian_backend import backend
-from .middlewares import PolicyMiddleware, DLPFilter
-from .registry import load_agents, lookup_agent, find_capability, orchestrator_id
+from .db import CONTROL_DB, audit, connect, init_db
 from .delegation import delegate_task as _delegate_task
-from .indexing.graphify import graphify
-from .indexing.store import all_nodes, all_edges
+from .finops.meter import mark_accepted
+from .finops.rollups import capo, capo_trend, heatmap, totals_by_task
+from .finops.standup import post_standup
+from .governance.hibernation import hibernate, thaw
+from .governance.hitl import enqueue, init_hitl, open_items, resolve
+from .governance.locks import check_occ, governed_write
+from .governance.permissions import can_write
+from .governance.reconcile import reconcile
+from .identity import AgentIdentity, require_identity
 from .indexing.compactor import compact
 from .indexing.drift import detect_drift
+from .indexing.graphify import graphify
 from .indexing.headroom import Headroom
+from .indexing.store import all_edges, all_nodes
 from .indexing.watcher import watch_and_index
-from .governance.permissions import can_write
-from .governance.locks import acquire_lock, release_lock, check_occ
-from .governance.hibernation import hibernate, thaw
-from .governance.hitl import init_hitl, enqueue, open_items, resolve
-from .governance.reconcile import reconcile
-from .finops.rollups import totals_by_task, heatmap, capo, capo_trend
-from .finops.standup import post_standup
-from .finops.meter import mark_accepted
-from .meta.runner import run_dream_cycle
 from .meta.dream_cycle import analyze
-from datetime import datetime, time, timedelta
+from .meta.runner import run_dream_cycle
+from .middlewares import DLPFilter, PolicyMiddleware
+from .obsidian_backend import backend
+from .registry import find_capability, load_agents, lookup_agent, orchestrator_id
+
 # Simple in-memory event bus for websocket
 dashboard_clients = set()
 
@@ -46,6 +49,7 @@ def notify_audit(agent, task_id, tool, ok, detail):
     }))
 
 async def _daily_standup_loop():
+    failures = 0
     while True:
         now = datetime.now()
         target = datetime.combine(now.date(), time(9, 0))   # 9am local
@@ -54,10 +58,16 @@ async def _daily_standup_loop():
         await asyncio.sleep((target - now).total_seconds())
         try:
             await post_standup()
+            failures = 0
         except Exception as e:
-            print("[standup] failed:", e)
+            failures += 1
+            print(f"[standup] failed ({failures}):", e)
+            audit("system", "standup_loop", "post_standup", False, str(e))
+            if failures >= 3:
+                await asyncio.sleep(min(300, 2 ** failures))
 
 async def _dream_loop():
+    failures = 0
     while True:
         now = datetime.now()
         target = datetime.combine(now.date(), time(3, 0))   # 3am local
@@ -66,8 +76,13 @@ async def _dream_loop():
         await asyncio.sleep((target - now).total_seconds())
         try:
             print("[dream-cycle]", await run_dream_cycle())
+            failures = 0
         except Exception as e:
-            print("[dream-cycle] failed:", e)
+            failures += 1
+            print(f"[dream-cycle] failed ({failures}):", e)
+            audit("system", "dream_loop", "run_dream_cycle", False, str(e))
+            if failures >= 3:
+                await asyncio.sleep(min(300, 2 ** failures))
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -121,9 +136,7 @@ async def dashboard_vault(path: str = ""):
     try:
         if path:
             return {"path": path, "note": await backend.read_note(path)}
-        listing = await backend._client.get("/vault/")  # noqa: SLF001 (read-only browse)
-        listing.raise_for_status()
-        return {"path": "", "entries": listing.json()}
+        return {"path": "", "entries": await backend.list_vault()}
     except Exception:  # noqa: BLE001
         raise HTTPException(status_code=502, detail="Obsidian backend error")
 
@@ -162,6 +175,7 @@ class DelegateBody(BaseModel):
 
 class AcceptBody(BaseModel):
     path: str
+    task_id: str
     row_id: str
 
 @app.get("/mcp/lookup_agent")
@@ -208,22 +222,20 @@ async def append_implement(body: GovernedAppendBody, ident: AgentIdentity = Depe
         notify_audit(ident.agent, ident.task_id, "append_implement", False, f"DENY: {decision.reason}")
         raise HTTPException(status_code=403, detail=decision.reason)
 
-    acquire_lock(body.path, ident.agent, ident.task_id)       # lease
-    try:
-        note = await backend.read_note(body.path)             # OCC read
-        check_occ(str(note.get("stat", {}).get("mtime", "")), body.expected_version)
-        scrubbed_content = DLPFilter.scrub(body.content)
-        await backend.patch(body.path, "heading", body.target, scrubbed_content,
-                            reject_if_preexists=True)         # idempotent write
-        notify_audit(ident.agent, ident.task_id, "append_implement", True, f"{body.path}#{body.target}")
-        return {"ok": True}
-    except HTTPException:
-        raise
-    except Exception as e:
-        notify_audit(ident.agent, ident.task_id, "append_implement", False, str(e))
-        raise HTTPException(status_code=502, detail="Obsidian backend error")
-    finally:
-        release_lock(body.path, ident.task_id)
+    with governed_write(body.path, ident.agent, ident.task_id):
+        try:
+            note = await backend.read_note(body.path)             # OCC read
+            check_occ(str(note.get("stat", {}).get("mtime", "")), body.expected_version)
+            scrubbed_content = DLPFilter.scrub(body.content)
+            await backend.patch(body.path, "heading", body.target, scrubbed_content,
+                                reject_if_preexists=True)         # idempotent write
+            notify_audit(ident.agent, ident.task_id, "append_implement", True, f"{body.path}#{body.target}")
+            return {"ok": True}
+        except HTTPException:
+            raise
+        except Exception as e:
+            notify_audit(ident.agent, ident.task_id, "append_implement", False, str(e))
+            raise HTTPException(status_code=502, detail="Obsidian backend error")
 
 @app.post("/mcp/delegate_task")
 async def delegate_task_ep(body: DelegateBody, ident: AgentIdentity = Depends(require_identity)):
@@ -235,7 +247,7 @@ async def delegate_task_ep(body: DelegateBody, ident: AgentIdentity = Depends(re
 async def accept_implement(body: AcceptBody, ident: AgentIdentity = Depends(require_identity)):
     if ident.agent != orchestrator_id():
         raise HTTPException(status_code=403, detail="Only the orchestrator may accept IMPLEMENT rows")
-    mark_accepted(body.row_id)
+    mark_accepted(body.task_id)
     notify_audit(ident.agent, ident.task_id, "accept_implement", True, f"{body.path}#{body.row_id}")
     return {"ok": True, "accepted": body.row_id}
 
@@ -288,7 +300,10 @@ async def tokens_ws(ws: WebSocket):
         while True:
             await ws.send_json({"by_task": totals_by_task(), "capo": capo()})
             await asyncio.sleep(3)
-    except Exception:
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        print("[tokens_ws] error:", e)
         await ws.close()
 
 # ---------- Phase 5: indexing + generation endpoints ----------

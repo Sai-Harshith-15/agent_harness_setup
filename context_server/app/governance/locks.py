@@ -4,11 +4,12 @@ Locks are leased rows in control_plane.db so a crash leaves a reclaimable record
 rather than an in-memory lock that vanishes. OCC compares a caller-supplied version
 hash against the live note; a mismatch = state_changed (never a silent overwrite).
 """
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException
 
-from ..db import connect, CONTROL_DB
+from ..db import CONTROL_DB, connect
 
 LEASE_SECONDS = 120
 
@@ -46,3 +47,12 @@ def check_occ(live_version: str, expected_version: str | None) -> None:
     if expected_version is not None and live_version != expected_version:
         raise HTTPException(status_code=409,
                             detail="state_changed: note was modified since it was read")
+
+
+@contextmanager
+def governed_write(resource: str, agent: str, task_id: str):
+    acquire_lock(resource, agent, task_id)
+    try:
+        yield
+    finally:
+        release_lock(resource, task_id)

@@ -5,7 +5,7 @@ Thaw re-issues the paused write, but the Obsidian idempotency guard
 """
 import json
 
-from ..db import connect, CONTROL_DB
+from ..db import CONTROL_DB, connect
 
 
 def hibernate(task_id: str, agent: str, reason: str, frozen_state: dict) -> None:

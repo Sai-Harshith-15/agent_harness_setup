@@ -4,8 +4,9 @@ orchestrator and Mission Control's /hitl page. A pending write carries a diff pr
 for the diff-modal.
 """
 import json
+from datetime import datetime, timedelta, timezone
 
-from ..db import connect, CONTROL_DB
+from ..db import CONTROL_DB, connect
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS hitl_queue (
@@ -16,7 +17,8 @@ CREATE TABLE IF NOT EXISTS hitl_queue (
     proposed_diff TEXT,           -- JSON: {path, target, before, after}
     status TEXT NOT NULL DEFAULT 'open',   -- open | approved | modified | rejected
     resolution TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    expires_at TEXT
 );
 """
 
@@ -27,10 +29,11 @@ def init_hitl() -> None:
 
 
 def enqueue(task_id: str, agent: str, question: str, proposed_diff: dict | None = None) -> int:
+    expires_at = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
     with connect(CONTROL_DB) as c:
         cur = c.execute(
-            "INSERT INTO hitl_queue (task_id, agent, question, proposed_diff) VALUES (?,?,?,?)",
-            (task_id, agent, question, json.dumps(proposed_diff) if proposed_diff else None),
+            "INSERT INTO hitl_queue (task_id, agent, question, proposed_diff, expires_at) VALUES (?,?,?,?,?)",
+            (task_id, agent, question, json.dumps(proposed_diff) if proposed_diff else None, expires_at),
         )
         return cur.lastrowid
 

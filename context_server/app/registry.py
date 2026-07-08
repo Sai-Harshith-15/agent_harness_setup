@@ -1,6 +1,7 @@
 """Loads registry/agents/*.md, parses YAML frontmatter, exposes lookup + capability search."""
-import os
 import glob
+import os
+
 import yaml
 
 REGISTRY_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "registry", "agents")

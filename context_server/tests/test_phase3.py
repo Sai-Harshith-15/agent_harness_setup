@@ -1,12 +1,25 @@
-import sys
 import os
+import sys
+
 from fastapi.testclient import TestClient
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from app.main import app
 
 
-def test_phase3_dod():
+def test_phase3_dod(monkeypatch):
+    import httpx
+
+    class MockResponse:
+        def raise_for_status(self): pass
+        def json(self):
+            return {"ok": True, "output": "mock", "tokens_in": 10, "tokens_out": 10}
+
+    async def mock_post(*args, **kwargs):
+        return MockResponse()
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
     with TestClient(app) as client:
         # 1. Orchestrator delegates to hermes
         res1 = client.post("/mcp/delegate_task",
@@ -25,7 +38,7 @@ def test_phase3_dod():
 
         # 3. Only orchestrator can accept an IMPLEMENT row (hermes fails)
         res3 = client.post("/mcp/accept_implement",
-                           json={"path": "IMPLEMENT.md", "row_id": "task-42"},
+                           json={"path": "IMPLEMENT.md", "task_id": "task-42", "row_id": "P4-1"},
                            headers={"X-Agent-Identity": "hermes:task-42:81e6f935bc2577e5e43022dc35d4ba61303a04e71ce4a398b1ba185ec4bf7c53"})
         assert res3.status_code == 403
 

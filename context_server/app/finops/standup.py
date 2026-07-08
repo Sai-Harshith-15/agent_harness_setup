@@ -7,9 +7,9 @@ standup twice in a day cannot double-append.
 """
 from datetime import date
 
-from .rollups import totals_by_task, capo
-from ..obsidian_backend import backend
 from ..governance.locks import acquire_lock, release_lock
+from ..obsidian_backend import backend
+from .rollups import capo, totals_by_task
 
 
 def build_standup_markdown() -> str:
@@ -27,9 +27,8 @@ def build_standup_markdown() -> str:
 
 async def post_standup() -> dict:
     # periodic_note path for today's daily note (plugin exposes this).
-    resp = await backend._client.get("/periodic/daily/")   # noqa: SLF001
-    resp.raise_for_status()
-    daily_path = resp.json().get("path") if resp.headers.get("content-type", "").startswith("application/json") else None
+    resp = await backend.periodic_daily()
+    daily_path = resp.get("path") if isinstance(resp, dict) else None
     daily_path = daily_path or "Daily Notes/" + date.today().isoformat() + ".md"
 
     md = build_standup_markdown()

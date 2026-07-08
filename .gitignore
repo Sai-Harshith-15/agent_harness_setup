@@ -11,7 +11,7 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
+/lib/
 lib64/
 parts/
 sdist/
@@ -43,4 +43,4 @@ hooks/
 .ruff_cache/
 .venv/
 venv/
-tools/
+test_hooks/

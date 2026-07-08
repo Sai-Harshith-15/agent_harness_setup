@@ -11,9 +11,9 @@ section and okf/log.md via the governed write path.
 """
 from datetime import date
 
-from ..indexing.drift import detect_drift
+from ..db import CONTROL_DB, connect
 from ..finops.rollups import capo, totals_by_task
-from ..db import connect, CONTROL_DB
+from ..indexing.drift import detect_drift
 
 
 def _recent_denials(limit: int = 50) -> list[dict]:

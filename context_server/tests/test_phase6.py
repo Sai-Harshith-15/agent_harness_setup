@@ -1,9 +1,9 @@
 import pytest
 from fastapi.testclient import TestClient
 
-from context_server.app.main import app
-from context_server.app.db import connect, CONTROL_DB
+from context_server.app.db import CONTROL_DB, connect
 from context_server.app.governance.locks import acquire_lock
+from context_server.app.main import app
 
 
 @pytest.fixture
@@ -26,17 +26,17 @@ def test_phase6_out_of_matrix_write_denied(client):
 def test_phase6_allowed_write_succeeds(client, monkeypatch):
     # Mock backend to simulate OCC pass
     import context_server.app.main as main_mod
-    
+
     class DummyBackend:
         async def read_note(self, path):
             return {"stat": {"mtime": "2026-07-08T00:00:00"}}
-            
+
         async def patch(self, path, target_type, target, content, reject_if_preexists):
             pass
 
         async def aclose(self):
             pass
-            
+
     monkeypatch.setattr(main_mod, "backend", DummyBackend())
 
     # 2. Allowed write succeeds (designated log heading)
@@ -52,7 +52,7 @@ def test_phase6_allowed_write_succeeds(client, monkeypatch):
 def test_phase6_lock_contention(client):
     # Acquire a lock manually first
     acquire_lock("okf/log.md", "hermes", "task-99")
-    
+
     # 3. Lock contention: two different tasks, same resource -> second gets 409
     res = client.post(
         "/mcp/append_implement",
@@ -74,7 +74,7 @@ def test_phase6_hitl_pause_and_resolve(client):
     data = res.json()
     assert data["paused"] is True
     item_id = data["hitl_item"]
-    
+
     # Verify in dashboard
     res_dash = client.get("/dashboard/hitl")
     assert res_dash.status_code == 200
@@ -82,12 +82,12 @@ def test_phase6_hitl_pause_and_resolve(client):
     assert len(items) == 1
     assert items[0]["id"] == item_id
     assert items[0]["task_id"] == "task-99"
-    
+
     # Verify it is hibernated in db
     with connect(CONTROL_DB) as c:
         hib = c.execute("SELECT * FROM hibernation WHERE task_id='task-99'").fetchone()
         assert hib is not None
-        
+
     # Resolve it
     res_patch = client.patch(
         "/dashboard/hitl",
@@ -95,7 +95,7 @@ def test_phase6_hitl_pause_and_resolve(client):
     )
     assert res_patch.status_code == 200
     assert res_patch.json()["status"] == "approved"
-    
+
     # Verify thawed (removed from hibernation)
     with connect(CONTROL_DB) as c:
         hib_after = c.execute("SELECT * FROM hibernation WHERE task_id='task-99'").fetchone()
@@ -103,39 +103,40 @@ def test_phase6_hitl_pause_and_resolve(client):
 
 
 def test_phase6_crash_reconciliation(client, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
     import context_server.app.governance.locks as locks
-    from datetime import datetime, timezone, timedelta
-    
+
     def _past_now():
         return datetime.now(timezone.utc) + timedelta(seconds=-500)
-    
+
     monkeypatch.setattr(locks, "_now", _past_now)
     acquire_lock("some/expired.md", "hermes", "task-expired")
-    
+
     with connect(CONTROL_DB) as c:
         rows = [dict(r) for r in c.execute("SELECT * FROM locks").fetchall()]
         print(f"DEBUG LOCKS AFTER EXPIRED: {rows}")
-        
+
     def _normal_now():
         return datetime.now(timezone.utc)
     monkeypatch.setattr(locks, "_now", _normal_now)
     acquire_lock("some/active.md", "opencode", "task-active")
-    
+
     with connect(CONTROL_DB) as c:
         rows = [dict(r) for r in c.execute("SELECT * FROM locks").fetchall()]
         print(f"DEBUG LOCKS AFTER ACTIVE: {rows}")
-        
+
     with connect(CONTROL_DB) as c:
         c.execute("INSERT OR REPLACE INTO hibernation (task_id, agent, reason, frozen_state) VALUES ('orphan-99', 'codex', 'crash', '{}')")
-    
+
     res = client.get("/dashboard/crashes")
     assert res.status_code == 200
     data = res.json()
     print("Dashboard crashes response:", data)
-    
+
     reaped = [r["resource"] for r in data["released_locks"]]
     assert "some/expired.md" in reaped, f"Data was: {data}"
     assert "some/active.md" not in reaped
-    
+
     orphans = [r["task_id"] for r in data["hibernated_orphans"]]
     assert "orphan-99" in orphans

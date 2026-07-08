@@ -1,9 +1,11 @@
-import pytest
-from fastapi.testclient import TestClient
-from context_server.app.main import app
 import os
 import tempfile
-import sys
+
+import pytest
+from fastapi.testclient import TestClient
+
+from context_server.app.main import app
+
 
 @pytest.fixture
 def client():
@@ -18,33 +20,28 @@ def test_phase9_dashboard_plan(client, monkeypatch):
         f.write("- [in-progress] (P1) Task 1 | agent=opencode capo=5 tokens=100\n")
         f.write("- [done] (P2) Task 2 | agent=hermes\n")
 
-    # Mock the path used by dashboard/plan to point to our temp file
-    import context_server.app.main as main_mod
-    
     # dashboard_plan uses os.path.join(root, "PLAN.md")
     # we can mock os.path.exists and open for it, or just monkeypatch os.path.join
     original_join = os.path.join
-    original_exists = os.path.exists
-    original_open = open
-    
+
     def mock_join(*args):
         if args and args[-1] == "PLAN.md":
             return path
         return original_join(*args)
-        
+
     monkeypatch.setattr(os.path, "join", mock_join)
 
     res = client.get("/dashboard/plan")
-    
+
     # cleanup temp file
     os.remove(path)
-    
+
     assert res.status_code == 200
     data = res.json()
     assert "rows" in data
     rows = data["rows"]
     assert len(rows) == 2
-    
+
     assert rows[0]["id"] == "P1"
     assert rows[0]["status"] == "in-progress"
     assert rows[0]["title"] == "Task 1"

@@ -4,6 +4,7 @@ Handles the self-signed cert (trust the plugin's cert, do not disable verificati
 with a documented HTTP fallback for dev.
 """
 import ssl
+
 import httpx
 
 from .config import settings
@@ -44,6 +45,18 @@ class ObsidianBackend:
             return r.status_code < 500
         except httpx.HTTPError:
             return False
+
+    async def list_vault(self) -> list[dict]:
+        r = await self._client.get("/vault/")
+        r.raise_for_status()
+        return r.json()
+
+    async def periodic_daily(self) -> dict:
+        r = await self._client.get("/periodic/daily/")
+        r.raise_for_status()
+        if r.headers.get("content-type", "").startswith("application/json"):
+            return r.json()
+        return {}
 
     async def search_simple(self, query: str) -> list[dict]:
         r = await self._client.post("/search/simple/", params={"query": query})

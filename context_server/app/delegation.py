@@ -1,9 +1,10 @@
 """delegate_task control plane (Phase 3.3)."""
 from fastapi import HTTPException
 
+from .adapters import TaskResult, adapter_for
+from .db import TOKEN_DB, audit, connect
 from .registry import lookup_agent, orchestrator_id
-from .adapters import adapter_for, TaskResult
-from .db import connect, TOKEN_DB, audit
+
 
 async def delegate_task(caller: str, task_id: str, target_agent: str, prompt: str) -> TaskResult:
     if caller != orchestrator_id():

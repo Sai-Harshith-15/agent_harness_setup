@@ -2,7 +2,7 @@
 
 The frontend /tokens page reads these directly.
 """
-from ..db import connect, TOKEN_DB
+from ..db import TOKEN_DB, connect
 
 
 def totals_by_task(limit: int = 20) -> list[dict]:
