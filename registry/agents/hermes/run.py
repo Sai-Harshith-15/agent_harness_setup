@@ -1,4 +1,4 @@
-import time
+import asyncio
 
 import uvicorn
 from fastapi import FastAPI
@@ -17,7 +17,7 @@ async def run_agent(req: RunRequest):
     out = f"[{req.agent_id}] (Real HTTP) processed task {req.task_id} with prompt: {req.prompt[:50]}..."
 
     # Simulate processing time
-    time.sleep(1)
+    await asyncio.sleep(1)
 
     return {
         "task_id": req.task_id,
@@ -28,4 +28,4 @@ async def run_agent(req: RunRequest):
     }
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8001)

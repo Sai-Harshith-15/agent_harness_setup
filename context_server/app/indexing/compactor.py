@@ -26,9 +26,38 @@ def compact(budget_tokens: int) -> dict:
         kept.append(n["path"])
         used += n["tokens"]
     collapsed = len(nodes) - len(kept)
+
+    summary = "Compacted nodes by degree and recency."
+    if collapsed > 0:
+        try:
+            import os
+
+            from litellm import completion
+            if os.environ.get("OPENAI_API_KEY") or os.environ.get("LITELLM_API_KEY"):
+                prompt = (
+                    f"Summarize the following {collapsed} discarded nodes into a single brief paragraph:\n"
+                    + "\n".join([f"{n['path']}: {n['summary']}" for n in nodes[len(kept):len(kept)+10]])
+                )
+                resp = completion(model="gpt-4o-mini", messages=[{"role": "user", "content": prompt}])
+                summary = resp.choices[0].message.content
+        except Exception:
+            pass
+
+    try:
+        from opentelemetry import trace
+        tracer = trace.get_tracer(__name__)
+        with tracer.start_as_current_span("compactor") as span:
+            span.set_attribute("budget", budget_tokens)
+            span.set_attribute("used", used)
+            span.set_attribute("collapsed", collapsed)
+            span.set_attribute("summary_len", len(summary))
+    except Exception:
+        pass
+
     return {
         "kept": kept,
         "kept_tokens": used,
         "collapsed_nodes": collapsed,
+        "summary": summary,
         "span": {"name": "compactor", "budget": budget_tokens, "used": used, "collapsed": collapsed},
     }

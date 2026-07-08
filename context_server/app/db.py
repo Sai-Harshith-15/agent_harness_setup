@@ -79,3 +79,13 @@ def audit(agent: str, task_id: str, tool: str, ok: bool, detail: str = "") -> No
             "INSERT INTO audit_log (agent, task_id, tool, ok, detail) VALUES (?,?,?,?,?)",
             (agent, task_id, tool, 1 if ok else 0, detail),
         )
+    try:
+        from opentelemetry import trace
+        tracer = trace.get_tracer(__name__)
+        with tracer.start_as_current_span(tool) as span:
+            span.set_attribute("agent", agent)
+            span.set_attribute("task_id", task_id)
+            span.set_attribute("ok", ok)
+            span.set_attribute("detail", detail)
+    except Exception:
+        pass

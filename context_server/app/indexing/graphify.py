@@ -17,7 +17,12 @@ _SKIP_DIRS = {".git", "node_modules", ".venv", "__pycache__", ".next", "hooks"}
 
 
 def _tokens(text: str) -> int:
-    return max(1, len(text) // 4)  # rough; swap for a real tokenizer later
+    try:
+        import tiktoken
+        enc = tiktoken.get_encoding("cl100k_base")
+        return max(1, len(enc.encode(text)))
+    except Exception:
+        return max(1, len(text) // 4)
 
 
 def graphify(root: str = ROOT) -> dict:

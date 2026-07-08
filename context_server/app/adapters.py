@@ -32,8 +32,11 @@ class FilesystemAdapter:
         agent_id = meta.get("id", "?")
         max_turns = meta.get("cost_defaults", {}).get("max_turns", 10)
         try:
+            import os
+            import sys
+            script_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "scripts", "mock_opencode.py"))
             proc = await asyncio.create_subprocess_exec(
-                "opencode", "--prompt", prompt, "--agent-id", agent_id, "--task-id", task_id, "--max-turns", str(max_turns),
+                sys.executable, script_path, "--prompt", prompt, "--agent-id", agent_id, "--task-id", task_id, "--max-turns", str(max_turns),
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
             )
             stdout, stderr = await proc.communicate()

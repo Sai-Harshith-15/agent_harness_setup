@@ -123,7 +123,10 @@ async def dashboard_state():
         locks = [dict(r) for r in c.execute("SELECT * FROM locks").fetchall()]
         recent = [dict(r) for r in c.execute(
             "SELECT * FROM audit_log ORDER BY id DESC LIMIT 25").fetchall()]
-    return {"agents": [], "tasks": [], "locks": locks, "recent_activity": recent, "stalls": []}
+        stalls = [dict(r) for r in c.execute("SELECT * FROM hitl_queue WHERE status='open'").fetchall()]
+        tasks = [dict(r) for r in c.execute("SELECT DISTINCT task_id, agent FROM audit_log ORDER BY id DESC LIMIT 50").fetchall()]
+    agents = list(load_agents().values())
+    return {"agents": agents, "tasks": tasks, "locks": locks, "recent_activity": recent, "stalls": stalls}
 
 @app.get("/dashboard/agents")
 async def dashboard_agents():

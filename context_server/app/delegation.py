@@ -16,6 +16,19 @@ async def delegate_task(caller: str, task_id: str, target_agent: str, prompt: st
     if meta.get("role") == "orchestrator":
         raise HTTPException(status_code=400, detail="Cannot delegate to the orchestrator itself")
 
+    # Enforce max_tokens budget (Phase 8 gap)
+    max_tokens = meta.get("cost_defaults", {}).get("max_tokens", 0)
+    if max_tokens > 0:
+        with connect(TOKEN_DB) as c:
+            row = c.execute(
+                "SELECT SUM(tokens_in + tokens_out) as total FROM token_ledger WHERE task_id=?",
+                (task_id,)
+            ).fetchone()
+            used = row["total"] or 0
+            if used >= max_tokens:
+                audit(caller, task_id, "delegate_task", False, f"DENY: Budget exceeded ({used}/{max_tokens})")
+                raise HTTPException(status_code=403, detail=f"Task token budget exceeded ({used} >= {max_tokens})")
+
     result = await adapter_for(meta).run(task_id, prompt, meta)
 
     with connect(TOKEN_DB) as c:
