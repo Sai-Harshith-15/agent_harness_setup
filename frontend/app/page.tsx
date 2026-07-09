@@ -1,3 +1,6 @@
+import { Activity, Lock, Cpu, Server, ShieldCheck, ShieldAlert, AlertCircle } from "lucide-react";
+import { ActivityStream } from "./components/ActivityStream";
+
 async function getHealth() {
   try {
     const res = await fetch("http://127.0.0.1:27180/health", { cache: "no-store" });
@@ -19,44 +22,80 @@ async function getState() {
 export default async function Home() {
   const [health, state] = await Promise.all([getHealth(), getState()]);
   const ok = health.status === "ok";
-  const color = ok ? "#3fb950" : health.status === "degraded" ? "#d29922" : "#f85149";
+  const degraded = health.status === "degraded";
+  
+  const statusColor = ok ? "bg-success" : degraded ? "bg-warning" : "bg-danger";
 
   return (
-    <main style={{ maxWidth: 920, margin: "0 auto", padding: "48px 24px" }}>
-      <h1 style={{ fontSize: 28 }}>Agentic OS — Mission Control</h1>
-      <div style={{ display: "flex", alignItems: "center", gap: 10, margin: "16px 0" }}>
-        <span style={{ width: 12, height: 12, borderRadius: 999, background: color }} />
-        <strong style={{ textTransform: "uppercase", letterSpacing: 1 }}>{health.status}</strong>
-        <span style={{ opacity: 0.7 }}>· Obsidian backend: {health.obsidian_backend ? "reachable" : "down"}</span>
+    <main className="p-8 md:p-12 lg:p-16 max-w-7xl mx-auto space-y-12">
+      <header className="flex flex-col md:flex-row md:items-end justify-between gap-6">
+        <div>
+          <h1 className="text-4xl md:text-5xl font-bold tracking-tight text-white mb-2">Agentic OS — Mission Control</h1>
+          <p className="text-white/50 text-lg">Real-time metrics and agent activity.</p>
+        </div>
+        
+        <div className="glass-panel px-6 py-4 flex items-center gap-4 border border-white/5">
+          <div className="relative flex items-center justify-center h-5 w-5">
+            <span className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ${statusColor}`}></span>
+            <span className={`relative inline-flex rounded-full h-3 w-3 ${statusColor}`}></span>
+          </div>
+          <div>
+            <div className="flex items-center gap-2">
+              <span className="uppercase tracking-widest text-xs font-bold text-white/80">{health.status}</span>
+            </div>
+            <div className="text-[10px] text-white/40 uppercase tracking-wider mt-0.5">
+              <span className={health.obsidian_backend ? "text-success/80" : "text-danger/80"}>
+                Obsidian backend: {health.obsidian_backend ? "reachable" : "down"}
+              </span>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+        
+        {/* Left Column: Locks & Quick Stats */}
+        <div className="lg:col-span-1 space-y-8">
+          <section className="glass-panel flex flex-col h-full min-h-[300px]">
+            <div className="p-6 border-b border-white/5 bg-white/[0.02]">
+              <div className="flex items-center justify-between">
+                <h2 className="text-sm uppercase tracking-widest text-white/50 font-semibold flex items-center gap-2">
+                  <Lock className="w-4 h-4" /> Active Locks
+                </h2>
+                <span className="bg-white/10 text-white/80 text-xs py-1 px-2 rounded-full font-mono">
+                  {state.locks.length}
+                </span>
+              </div>
+            </div>
+            
+            <div className="p-6 flex-1 flex flex-col">
+              {state.locks.length === 0 ? (
+                <div className="flex-1 flex flex-col items-center justify-center py-12 text-center">
+                  <ShieldCheck className="w-12 h-12 mb-4 text-white/10" />
+                  <p className="text-sm text-white/40">No resources currently locked.</p>
+                </div>
+              ) : (
+                <ul className="space-y-3 flex-1">
+                  {state.locks.map((l: any) => (
+                    <li key={l.resource} className="bg-white/5 rounded-xl p-4 border border-white/5 flex flex-col gap-2 transition-colors hover:bg-white/10">
+                      <span className="font-mono text-xs text-accent">{l.resource}</span>
+                      <span className="text-sm text-white/60">
+                        {l.agent} <span className="opacity-40">({l.task_id})</span>
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </section>
+        </div>
+
+        {/* Right Column: Activity Stream */}
+        <div className="lg:col-span-2">
+          <ActivityStream initialActivity={state.recent_activity} />
+        </div>
+        
       </div>
-
-      <section style={{ marginTop: 32 }}>
-        <h2 style={{ fontSize: 18, opacity: 0.9 }}>Active locks</h2>
-        {state.locks.length === 0
-          ? <p style={{ opacity: 0.6 }}>None held.</p>
-          : <ul>{state.locks.map((l: any) => <li key={l.resource}>{l.resource} — {l.agent}:{l.task_id}</li>)}</ul>}
-      </section>
-
-      <section style={{ marginTop: 32 }}>
-        <h2 style={{ fontSize: 18, opacity: 0.9 }}>Recent activity</h2>
-        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 14 }}>
-          <thead>
-            <tr style={{ textAlign: "left", opacity: 0.6 }}>
-              <th style={{ padding: "6px 8px" }}>ts</th><th>agent</th><th>tool</th><th>ok</th><th>detail</th>
-            </tr>
-          </thead>
-          <tbody>
-            {state.recent_activity.map((a: any) => (
-              <tr key={a.id} style={{ borderTop: "1px solid #21262d" }}>
-                <td style={{ padding: "6px 8px", whiteSpace: "nowrap" }}>{a.ts}</td>
-                <td>{a.agent}</td><td>{a.tool}</td>
-                <td style={{ color: a.ok ? "#3fb950" : "#f85149" }}>{a.ok ? "✓" : "✕"}</td>
-                <td style={{ opacity: 0.8 }}>{a.detail}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </section>
     </main>
   );
 }

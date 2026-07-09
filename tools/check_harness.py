@@ -4,6 +4,7 @@ import glob
 import os
 import re
 import sys
+import subprocess
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -24,10 +25,24 @@ def check() -> list[str]:
     # exactly one orchestrator in the registry
     orchestrators = []
     for path in glob.glob(os.path.join(ROOT, "registry", "agents", "*.md")):
-        if re.search(r"^role:\s*orchestrator\s*$", open(path, encoding="utf-8").read(), re.M):
+        content = open(path, encoding="utf-8").read()
+        if re.search(r"^role:\s*orchestrator\s*$", content, re.M):
             orchestrators.append(os.path.basename(path))
+            if not re.search(r"^forbid_native_cross_agent:\s*true\s*$", content, re.M):
+                errors.append(f"orchestrator {os.path.basename(path)} missing forbid_native_cross_agent: true")
     if len(orchestrators) != 1:
         errors.append(f"expected exactly 1 orchestrator, found {len(orchestrators)}: {orchestrators}")
+
+    # OKF concept frontmatter
+    for path in glob.glob(os.path.join(ROOT, "okf", "concepts", "*.md")):
+        content = open(path, encoding="utf-8").read()
+        if not content.startswith("---\n"):
+            errors.append(f"OKF concept {os.path.basename(path)} missing YAML frontmatter")
+        else:
+            frontmatter = content.split("---")[1]
+            for key in ["id:", "title:", "tags:", "source:"]:
+                if key not in frontmatter:
+                    errors.append(f"OKF concept {os.path.basename(path)} missing {key} in frontmatter")
 
     # PLAN.md rows must be parseable
     row = re.compile(r"^- \[(backlog|in-progress|delegated|awaiting-hitl|hibernated|done|rejected)\] \(([^)]+)\) .+\| agent=\S+")
@@ -38,8 +53,21 @@ def check() -> list[str]:
         errors.append(f"{len(bad)} malformed PLAN.md row(s); first: {bad[0]!r}")
 
     # IMPLEMENT.md must be append-only vs. its committed length (simple guard)
-    if "| accepted |" not in _read("IMPLEMENT.md"):
+    impl_content = _read("IMPLEMENT.md")
+    if "| accepted |" not in impl_content:
         errors.append("IMPLEMENT.md missing the ledger header")
+    try:
+        committed = subprocess.check_output(["git", "show", "HEAD:IMPLEMENT.md"], encoding="utf-8", stderr=subprocess.DEVNULL, cwd=ROOT)
+        if len(impl_content.splitlines()) < len(committed.splitlines()):
+            errors.append("IMPLEMENT.md is shorter than the committed version (must be append-only)")
+    except Exception:
+        pass  # Not a git repo or no HEAD yet
+
+    # Test-green gate
+    try:
+        subprocess.check_call([sys.executable, "-m", "pytest", "context_server/tests/"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=ROOT)
+    except subprocess.CalledProcessError:
+        errors.append("pytest suite failed (all tests must be green)")
 
     return errors
 

@@ -1,5 +1,6 @@
 "use client";
 import { useEffect, useState } from "react";
+import Editor from "@monaco-editor/react";
 
 export default function Hitl() {
   const [items, setItems] = useState<any[]>([]);
@@ -33,9 +34,15 @@ export default function Hitl() {
         <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.6)", display: "grid", placeItems: "center" }}>
           <div style={{ background: "#0d1117", border: "1px solid #30363d", borderRadius: 10, padding: 20, width: 560 }}>
             <h3>Proposed change</h3>
-            <pre style={{ background: "#161b22", padding: 12, borderRadius: 6, overflow: "auto", fontSize: 12 }}>
-{JSON.stringify(active.proposed_diff ? JSON.parse(active.proposed_diff) : {}, null, 2)}
-            </pre>
+            <div style={{ height: "300px", marginTop: "12px" }}>
+              <Editor
+                height="100%"
+                defaultLanguage="json"
+                theme="vs-dark"
+                value={JSON.stringify(active.proposed_diff ? JSON.parse(active.proposed_diff) : {}, null, 2)}
+                options={{ readOnly: true, minimap: { enabled: false } }}
+              />
+            </div>
             <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
               <button onClick={() => resolve("approved")}>Approve</button>
               <button onClick={() => resolve("modified")}>Modify</button>

@@ -29,7 +29,7 @@ def test_phase6_allowed_write_succeeds(client, monkeypatch):
 
     class DummyBackend:
         async def read_note(self, path):
-            return {"stat": {"mtime": "2026-07-08T00:00:00"}}
+            return {"content": ""}
 
         async def patch(self, path, target_type, target, content, reject_if_preexists):
             pass
@@ -42,7 +42,7 @@ def test_phase6_allowed_write_succeeds(client, monkeypatch):
     # 2. Allowed write succeeds (designated log heading)
     res = client.post(
         "/mcp/append_implement",
-        json={"path": "okf/log.md", "target": "Agent Updates", "content": "- did the thing", "expected_version": "2026-07-08T00:00:00"},
+        json={"path": "okf/log.md", "target": "Agent Updates", "content": "- did the thing", "expected_version": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
         headers={"X-Agent-Identity": "opencode:task-6:9b9f441bdd1578ac0104b0589073d38a666c76130b9430f173d9b919623a8ae5"}
     )
     assert res.status_code == 200

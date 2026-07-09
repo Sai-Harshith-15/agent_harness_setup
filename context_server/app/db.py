@@ -2,8 +2,18 @@
 import os
 import sqlite3
 from contextlib import contextmanager
+import threading
 
 from .config import settings
+
+_lamport = 0
+_lamport_lock = threading.Lock()
+
+def _next_lamport() -> int:
+    global _lamport
+    with _lamport_lock:
+        _lamport += 1
+        return _lamport
 
 TOKEN_DB = "token_usage.db"
 CONTROL_DB = "control_plane.db"
@@ -45,6 +55,17 @@ CREATE TABLE IF NOT EXISTS audit_log (
     ok INTEGER NOT NULL,
     detail TEXT
 );
+CREATE TABLE IF NOT EXISTS breaker_state (
+    agent TEXT NOT NULL,
+    tool TEXT NOT NULL,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    last_trip_time REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (agent, tool)
+);
+CREATE TABLE IF NOT EXISTS rate_limits (
+    agent TEXT NOT NULL,
+    timestamp REAL NOT NULL
+);
 """
 
 
@@ -81,11 +102,18 @@ def audit(agent: str, task_id: str, tool: str, ok: bool, detail: str = "") -> No
         )
     try:
         from opentelemetry import trace
+        from opentelemetry.trace.status import Status, StatusCode
         tracer = trace.get_tracer(__name__)
         with tracer.start_as_current_span(tool) as span:
             span.set_attribute("agent", agent)
             span.set_attribute("task_id", task_id)
             span.set_attribute("ok", ok)
             span.set_attribute("detail", detail)
+            span.set_attribute("lamport_seq", _next_lamport())
+            if not ok:
+                span.set_status(Status(StatusCode.ERROR))
+                # basic failure class heuristic
+                fail_class = "auth" if "DENY" in detail else "system"
+                span.set_attribute("failure_class", fail_class)
     except Exception:
         pass

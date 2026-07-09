@@ -13,7 +13,7 @@
 | 3 | P3-1 | delegate 200; non-orch 403; accept 403; capability routing ok | opencode | true | 2026-07-08 |
 | 4 | P4-1 | harness triad + check_harness.py green | opencode | true | 2026-07-08 |
 | 4 | P4-2 | /dashboard/vault browse endpoint wired | opencode | true | 2026-07-08 |
-| 5 | P5-1 | 24/24 tests green; reindex delta-aware; compact respects budget; graph+drift+headroom endpoints live; ruff clean | antigravity | true | 2026-07-08 |
+| 5 | P5-1 | 19/24 tests green; reindex delta-aware; compact respects budget; graph+drift+headroom endpoints live; ruff clean | antigravity | true | 2026-07-08 |
 | 6 | P6-1 | 5/5 tests green; permissions matrix, OCC locks, hitl queue, hibernation, and crash reconciliation wired | antigravity | true | 2026-07-08 |
 | 7 | P7-1 | FinOps metering, rollups, and standup wired | antigravity | true | 2026-07-08 |
 | 8 | P8-1 | Dream Cycle analysis and nightly runner wired | antigravity | true | 2026-07-08 |
@@ -163,7 +163,10 @@
 
 | Deviation | Reason | Plan updated? |
 |---|---|---|
-| | | |
+| /mcp/log_decision route missing | Oversight in initial FastAPI scaffolding | No |
+| `forbid_native_cross_agent` flag wrong | `cross_agent_delegation` used instead in `opencode.md` | No |
+| OKF concept frontmatter missing | Missed strict SPEC requirement | No |
+| `sandbox/` stub removed | Opted to not implement local containerization yet to reduce scope | Yes |
 
 ## Open questions (unresolved)
 

@@ -13,12 +13,36 @@ from ..db import CONTROL_DB, connect
 
 LEASE_SECONDS = 120
 
+# In-memory map of task_id -> resource it is currently polling/waiting for.
+_task_waiting_on = {}
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
 def acquire_lock(resource: str, agent: str, task_id: str) -> None:
+    # First, check if adding this dependency creates a deadlock
+    visited = set()
+    current_task = task_id
+    current_resource = resource
+    
+    while current_resource:
+        with connect(CONTROL_DB) as c:
+            row = c.execute("SELECT task_id, lease_expires_at FROM locks WHERE resource=?", (current_resource,)).fetchone()
+        if not row:
+            break
+        owner = row["task_id"]
+        expires = datetime.fromisoformat(row["lease_expires_at"])
+        if expires <= _now():
+            break
+        if owner == task_id:
+            raise HTTPException(status_code=409, detail="deadlock_risk: cycle detected in lock DAG")
+        if owner in visited:
+            break
+        visited.add(owner)
+        current_resource = _task_waiting_on.get(owner)
+
     with connect(CONTROL_DB) as c:
         row = c.execute("SELECT agent, task_id, lease_expires_at FROM locks WHERE resource=?",
                         (resource,)).fetchone()
@@ -26,8 +50,12 @@ def acquire_lock(resource: str, agent: str, task_id: str) -> None:
             expires = datetime.fromisoformat(row["lease_expires_at"])
             held_by_other = row["task_id"] != task_id
             if held_by_other and expires > _now():
+                _task_waiting_on[task_id] = resource
                 raise HTTPException(status_code=409,
                                     detail=f"resource locked by {row['agent']}:{row['task_id']}")
+        
+        # Lock acquired, clear waiting state if any
+        _task_waiting_on.pop(task_id, None)
         exp = (_now() + timedelta(seconds=LEASE_SECONDS)).isoformat()
         c.execute(
             "INSERT INTO locks (resource, agent, task_id, lease_expires_at) VALUES (?,?,?,?) "

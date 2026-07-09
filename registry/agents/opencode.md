@@ -3,7 +3,7 @@ id: opencode
 role: orchestrator
 adapter: filesystem
 native_subagent_protocol: opencode-subagents
-cross_agent_delegation: delegate_task
+forbid_native_cross_agent: true
 cost_defaults:
   max_turns: 40
   orchestrator_overlay: true

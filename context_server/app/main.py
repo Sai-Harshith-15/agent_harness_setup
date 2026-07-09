@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import os
 import re
 from contextlib import asynccontextmanager
@@ -7,6 +8,12 @@ from datetime import datetime, time, timedelta
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 
 from .config import settings
 from .db import CONTROL_DB, audit, connect, init_db
@@ -109,6 +116,14 @@ async def lifespan(app: FastAPI):
         await backend.aclose()
 
 app = FastAPI(title="Agentic OS Context Server", version="0.2.0", lifespan=lifespan)
+
+resource = Resource.create({"service.name": "context_server"})
+provider = TracerProvider(resource=resource)
+processor = BatchSpanProcessor(OTLPSpanExporter(endpoint="http://localhost:4317", insecure=True))
+provider.add_span_processor(processor)
+trace.set_tracer_provider(provider)
+FastAPIInstrumentor.instrument_app(app)
+
 app.add_middleware(PolicyMiddleware)
 
 # ---------- health + dashboard ----------
@@ -211,6 +226,7 @@ async def read_note(path: str, ident: AgentIdentity = Depends(require_identity))
     try:
         note = await backend.read_note(path)
         if "content" in note:
+            note["version_hash"] = hashlib.sha256((note["content"] or "").encode("utf-8")).hexdigest()
             note["content"] = DLPFilter.scrub(note["content"])
         notify_audit(ident.agent, ident.task_id, "read_note", True, path)
         return note
@@ -228,7 +244,8 @@ async def append_implement(body: GovernedAppendBody, ident: AgentIdentity = Depe
     with governed_write(body.path, ident.agent, ident.task_id):
         try:
             note = await backend.read_note(body.path)             # OCC read
-            check_occ(str(note.get("stat", {}).get("mtime", "")), body.expected_version)
+            current_version = hashlib.sha256((note.get("content") or "").encode("utf-8")).hexdigest()
+            check_occ(current_version, body.expected_version)
             scrubbed_content = DLPFilter.scrub(body.content)
             await backend.patch(body.path, "heading", body.target, scrubbed_content,
                                 reject_if_preexists=True)         # idempotent write
@@ -238,6 +255,29 @@ async def append_implement(body: GovernedAppendBody, ident: AgentIdentity = Depe
             raise
         except Exception as e:
             notify_audit(ident.agent, ident.task_id, "append_implement", False, str(e))
+            raise HTTPException(status_code=502, detail="Obsidian backend error")
+
+@app.post("/mcp/log_decision")
+async def log_decision(body: GovernedAppendBody, ident: AgentIdentity = Depends(require_identity)):
+    decision = can_write(body.path, "heading", body.target)   # permission matrix
+    if not decision.allowed:
+        notify_audit(ident.agent, ident.task_id, "log_decision", False, f"DENY: {decision.reason}")
+        raise HTTPException(status_code=403, detail=decision.reason)
+
+    with governed_write(body.path, ident.agent, ident.task_id):
+        try:
+            note = await backend.read_note(body.path)             # OCC read
+            current_version = hashlib.sha256((note.get("content") or "").encode("utf-8")).hexdigest()
+            check_occ(current_version, body.expected_version)
+            scrubbed_content = DLPFilter.scrub(body.content)
+            await backend.patch(body.path, "heading", body.target, scrubbed_content,
+                                reject_if_preexists=True)         # idempotent write
+            notify_audit(ident.agent, ident.task_id, "log_decision", True, f"{body.path}#{body.target}")
+            return {"ok": True}
+        except HTTPException:
+            raise
+        except Exception as e:
+            notify_audit(ident.agent, ident.task_id, "log_decision", False, str(e))
             raise HTTPException(status_code=502, detail="Obsidian backend error")
 
 @app.post("/mcp/delegate_task")
@@ -279,6 +319,11 @@ async def resolve_hitl(body: ResolveBody):
 @app.get("/dashboard/crashes")
 async def dashboard_crashes():
     return reconcile()
+
+@app.post("/dashboard/crashes/{task_id}/rerun")
+async def dashboard_crashes_rerun(task_id: str):
+    thaw(task_id)
+    return {"ok": True, "task_id": task_id, "status": "thawed"}
 
 # ---------- Phase 7: FinOps ----------
 
