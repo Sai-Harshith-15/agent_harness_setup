@@ -12,8 +12,8 @@ export function middleware(request: NextRequest) {
   }
 
   // If there's no valid token and no auth header, redirect to /login
-  // For this prototype, we just expect the token to be "admin-token-123"
-  if (token !== 'admin-token-123' && authHeader !== 'Bearer admin-token-123') {
+  const expectedPin = process.env.MISSION_CONTROL_PIN || 'admin-token-123'
+  if (token !== expectedPin && authHeader !== `Bearer ${expectedPin}`) {
     return NextResponse.redirect(new URL('/login', request.url))
   }
 

@@ -2,21 +2,15 @@ import { Activity, Lock, Cpu, Server, ShieldCheck, ShieldAlert, AlertCircle } fr
 import { ActivityStream } from "./components/ActivityStream";
 
 async function getHealth() {
-  try {
-    const res = await fetch("http://127.0.0.1:27180/health", { cache: "no-store" });
-    return await res.json();
-  } catch {
-    return { status: "unreachable", obsidian_backend: false };
-  }
+  const res = await fetch("http://127.0.0.1:27180/health", { cache: "no-store" });
+  if (!res.ok) throw new Error("Failed to fetch health");
+  return await res.json();
 }
 
 async function getState() {
-  try {
-    const res = await fetch("http://127.0.0.1:27180/dashboard/state", { cache: "no-store" });
-    return await res.json();
-  } catch {
-    return { locks: [], recent_activity: [] };
-  }
+  const res = await fetch("http://127.0.0.1:27180/dashboard/state", { cache: "no-store" });
+  if (!res.ok) throw new Error("Failed to fetch state");
+  return await res.json();
 }
 
 export default async function Home() {

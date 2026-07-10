@@ -37,11 +37,26 @@ def reconcile(startup: bool = False) -> dict:
         audit("system", "crash-reconcile", "release_lock", True, f"{r['resource']} released:ttl_expiry")
     for r in crashes:
         audit("system", "crash-reconcile", "release_lock", False, f"{r['resource']} released:infrastructure_crash")
+        try:
+            from opentelemetry import trace
+            from opentelemetry.trace.status import Status, StatusCode
+            from .snapshot import restore_snapshot
+            tracer = trace.get_tracer(__name__)
+            agent, task_id = r["was"].split(":", 1)
+            with tracer.start_as_current_span("crash_reconcile") as span:
+                span.set_attribute("resource", r["resource"])
+                span.set_attribute("task_id", task_id)
+                span.set_attribute("agent", agent)
+                span.set_status(Status(StatusCode.ERROR, "infrastructure_crash"))
+            restore_snapshot(task_id)
+        except Exception as e:
+            print("[reconcile] Failed to rollback/span for crash:", e)
     for r_id in rejected_hitl:
         audit("system", "crash-reconcile", "hitl_expire", True, f"hitl item {r_id} auto-expired")
-        
+
     if startup and crashes:
-        import os, re
+        import os
+        import re
         root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         plan_path = os.path.join(root, "PLAN.md")
         if os.path.exists(plan_path):

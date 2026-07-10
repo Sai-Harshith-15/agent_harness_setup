@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     obsidian_http_url: str = "http://127.0.0.1:27123"
     obsidian_cert_path: str | None = None
     allow_http_fallback: bool = True
+    dlp_hit_policy: str = "redact"  # redact | block | quarantine
 
     context_server_host: str = "127.0.0.1"
     context_server_port: int = 27180

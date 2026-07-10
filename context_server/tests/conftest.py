@@ -10,6 +10,7 @@ import os
 def pytest_configure(config):
     """Disable the file watcher before any module is imported by tests."""
     os.environ["ENABLE_WATCHER"] = "false"
+    os.environ["ENABLE_OTEL"] = "false"
 
 
 import pytest  # noqa: E402

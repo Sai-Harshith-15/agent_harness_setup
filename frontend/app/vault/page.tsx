@@ -2,8 +2,7 @@ import { api } from "@/lib/api";
 
 export default async function Vault({ searchParams }: { searchParams: { path?: string } }) {
   const path = searchParams.path || "";
-  const data = await api<any>(`/dashboard/vault${path ? `?path=${encodeURIComponent(path)}` : ""}`)
-    .catch(() => ({ entries: [], note: null }));
+  const data = await api<any>(`/dashboard/vault${path ? `?path=${encodeURIComponent(path)}` : ""}`);
   return (
     <main style={{ padding: 24 }}>
       <h1>Vault <span style={{ fontSize: 12, opacity: 0.6 }}>(read-only)</span></h1>

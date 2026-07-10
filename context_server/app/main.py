@@ -4,6 +4,7 @@ import os
 import re
 from contextlib import asynccontextmanager
 from datetime import datetime, time, timedelta
+
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from opentelemetry import trace
@@ -13,11 +14,13 @@ from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from pydantic import BaseModel
+
 from .config import settings
 from .db import CONTROL_DB, audit, connect, init_db
 from .delegation import delegate_task as _delegate_task
-from .finops.meter import mark_accepted, record as meter_record
-from .finops.rollups import capo, capo_trend, heatmap, totals_by_task
+from .finops.meter import mark_accepted
+from .finops.meter import record as meter_record
+from .finops.rollups import capo, capo_trend, heatmap, totals_by_task, raw_ledger
 from .finops.standup import post_standup
 from .governance.hibernation import hibernate, thaw
 from .governance.hitl import enqueue, init_hitl, open_items, resolve
@@ -93,6 +96,15 @@ async def _dream_loop():
 async def lifespan(app: FastAPI):
     init_db()
     init_hitl()
+    
+    # Configure Langfuse for LLM traces (Gap 3.3)
+    if os.environ.get("LANGFUSE_PUBLIC_KEY"):
+        try:
+            import litellm
+            litellm.success_callback = ["langfuse"]
+        except ImportError:
+            pass
+            
     print("[boot] crash reconciliation:", reconcile(startup=True))   # reap crash-orphaned leases
     asyncio.create_task(_daily_standup_loop())
     asyncio.create_task(_dream_loop())
@@ -117,8 +129,9 @@ app = FastAPI(title="Agentic OS Context Server", version="0.2.0", lifespan=lifes
 
 resource = Resource.create({"service.name": "context_server"})
 provider = TracerProvider(resource=resource)
-processor = BatchSpanProcessor(OTLPSpanExporter(endpoint="http://localhost:4317", insecure=True))
-provider.add_span_processor(processor)
+if os.environ.get("ENABLE_OTEL", "true").lower() not in ("0", "false", "no"):
+    processor = BatchSpanProcessor(OTLPSpanExporter(endpoint="http://localhost:4317", insecure=True))
+    provider.add_span_processor(processor)
 trace.set_tracer_provider(provider)
 FastAPIInstrumentor.instrument_app(app)
 
@@ -293,7 +306,7 @@ async def accept_implement(body: AcceptBody, ident: AgentIdentity = Depends(requ
     if ident.agent != orchestrator_id():
         raise HTTPException(status_code=403, detail="Only the orchestrator may accept IMPLEMENT rows")
     mark_accepted(body.task_id)
-    
+
     # Phase 6.3: physically append the accepted row to IMPLEMENT.md
     import datetime
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -308,7 +321,7 @@ async def accept_implement(body: AcceptBody, ident: AgentIdentity = Depends(requ
                 title = m.group("title")
                 agent = m.group("agent")
                 break
-                
+
     impl_path = os.path.join(root, body.path)
     if os.path.exists(impl_path):
         with open(impl_path, "r", encoding="utf-8") as f:
@@ -317,7 +330,7 @@ async def accept_implement(body: AcceptBody, ident: AgentIdentity = Depends(requ
         inserted = False
         new_row = f"| {phase} | {body.row_id} | {title} | {agent} | true | {datetime.datetime.now().strftime('%Y-%m-%d')} |"
         for line in lines:
-            if line.startswith("---") and not inserted and any("| phase |" in l for l in out_lines):
+            if line.startswith("---") and not inserted and any("| phase |" in line_ for line_ in out_lines):
                 out_lines.append(new_row)
                 inserted = True
             out_lines.append(line)
@@ -325,7 +338,7 @@ async def accept_implement(body: AcceptBody, ident: AgentIdentity = Depends(requ
             out_lines.append(new_row)
         with open(impl_path, "w", encoding="utf-8") as f:
             f.write("\n".join(out_lines))
-            
+
     notify_audit(ident.agent, ident.task_id, "accept_implement", True, f"{body.path}#{body.row_id}")
     return {"ok": True, "accepted": body.row_id}
 
@@ -335,11 +348,12 @@ async def request_clarification(body: ClarifyBody, ident: AgentIdentity = Depend
               frozen_state={"question": body.question, "diff": body.proposed_diff})
     item_id = enqueue(ident.task_id, ident.agent, body.question, body.proposed_diff)
     notify_audit(ident.agent, ident.task_id, "request_clarification", True, f"queued #{item_id}")
-    
+
     # Route to orchestrator in the background (Phase 6.5)
     import asyncio
-    from .registry import lookup_agent, orchestrator_id
+
     from .adapters import adapter_for
+    from .registry import lookup_agent, orchestrator_id
     orch_meta = lookup_agent(orchestrator_id())
     if orch_meta:
         async def _notify():
@@ -348,7 +362,7 @@ async def request_clarification(body: ClarifyBody, ident: AgentIdentity = Depend
             except Exception:
                 pass
         asyncio.create_task(_notify())
-        
+
     return {"paused": True, "hitl_item": item_id}
 
 @app.get("/dashboard/hitl")
@@ -369,6 +383,25 @@ async def resolve_hitl(body: ResolveBody):
 async def dashboard_crashes():
     return reconcile()
 
+@app.get("/dashboard/task/{task_id}")
+async def dashboard_task(task_id: str):
+    with connect(CONTROL_DB) as c:
+        spans = c.execute("SELECT id, ts, agent, tool, ok, detail FROM audit_log WHERE task_id=? ORDER BY ts", (task_id,)).fetchall()
+        hitl = c.execute("SELECT id, status, resolution, ts FROM hitl_queue WHERE task_id=? ORDER BY ts", (task_id,)).fetchall()
+        crashes = c.execute("SELECT reason, frozen_state, created_at FROM hibernated_tasks WHERE task_id=?", (task_id,)).fetchall()
+    
+    from .db import TOKEN_DB
+    with connect(TOKEN_DB) as tc:
+        tokens = tc.execute("SELECT agent, input_tokens, output_tokens, model, cost_usd FROM token_ledger WHERE task_id=?", (task_id,)).fetchall()
+    
+    return {
+        "task_id": task_id,
+        "spans": spans,
+        "hitl": hitl,
+        "crashes": crashes,
+        "tokens": tokens
+    }
+
 @app.post("/dashboard/crashes/{task_id}/rerun")
 async def dashboard_crashes_rerun(task_id: str):
     thaw(task_id)
@@ -379,6 +412,10 @@ async def dashboard_crashes_rerun(task_id: str):
 @app.get("/dashboard/tokens")
 async def dashboard_tokens():
     return {"by_task": totals_by_task(), "heatmap": heatmap()}
+
+@app.get("/dashboard/tokens/raw")
+async def dashboard_tokens_raw(start_date: str | None = None, end_date: str | None = None):
+    return {"rows": raw_ledger(start_date, end_date)}
 
 @app.get("/dashboard/capo")
 async def dashboard_capo():

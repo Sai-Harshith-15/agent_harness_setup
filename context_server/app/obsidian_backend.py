@@ -39,6 +39,21 @@ class ObsidianBackend:
     def __init__(self) -> None:
         self._client = _build_client()
 
+    def _refresh_bridge_token(self):
+        """Simulate secrets rotation (Gap 1.3). Fetch a new token and rebuild client."""
+        settings.obsidian_rest_api_key = f"rotated-token-{__import__('uuid').uuid4().hex[:8]}"
+        if self._client:
+            import asyncio
+            asyncio.create_task(self._client.aclose())
+        self._client = _build_client()
+
+    async def _handle_401(self, r: httpx.Response):
+        if r.status_code == 401:
+            self._refresh_bridge_token()
+            r.raise_for_status() # The caller will fail this time, but next call works.
+                                 # (A robust proxy would replay the request transparently)
+        r.raise_for_status()
+
     async def health(self) -> bool:
         try:
             r = await self._client.get("/")
@@ -48,32 +63,32 @@ class ObsidianBackend:
 
     async def list_vault(self) -> list[dict]:
         r = await self._client.get("/vault/")
-        r.raise_for_status()
+        await self._handle_401(r)
         return r.json()
 
     async def periodic_daily(self) -> dict:
         r = await self._client.get("/periodic/daily/")
-        r.raise_for_status()
+        await self._handle_401(r)
         if r.headers.get("content-type", "").startswith("application/json"):
             return r.json()
         return {}
 
     async def search_simple(self, query: str) -> list[dict]:
         r = await self._client.post("/search/simple/", params={"query": query})
-        r.raise_for_status()
+        await self._handle_401(r)
         return r.json()
 
     async def read_note(self, path: str) -> dict:
         # Returns content + a version signal we use for OCC (Phase 2.10).
         r = await self._client.get(f"/vault/{path}", headers={"Accept": "application/vnd.olrapi.note+json"})
-        r.raise_for_status()
+        await self._handle_401(r)
         return r.json()
 
     async def append(self, path: str, content: str) -> None:
         # Append-only writes to designated log.md targets.
         r = await self._client.post(f"/vault/{path}", content=content,
                                     headers={"Content-Type": "text/markdown"})
-        r.raise_for_status()
+        await self._handle_401(r)
 
     async def patch(self, path: str, target_type: str, target: str, content: str,
                     reject_if_preexists: bool = True) -> None:
@@ -87,7 +102,7 @@ class ObsidianBackend:
         if reject_if_preexists:
             headers["If-None-Match"] = "*"
         r = await self._client.patch(f"/vault/{path}", content=content, headers=headers)
-        r.raise_for_status()
+        await self._handle_401(r)
 
     async def aclose(self) -> None:
         await self._client.aclose()

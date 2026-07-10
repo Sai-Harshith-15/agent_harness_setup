@@ -1,7 +1,7 @@
 import { api } from "@/lib/api";
 
 export default async function Agents() {
-  const data = await api<any>("/dashboard/agents").catch(() => ({ agents: [], orchestrator: null }));
+  const data = await api<any>("/dashboard/agents");
   return (
     <main style={{ padding: 24 }}>
       <h1>Agents <span style={{ fontSize: 13, opacity: 0.6 }}>· orchestrator: {data.orchestrator}</span></h1>

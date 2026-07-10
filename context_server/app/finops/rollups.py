@@ -62,3 +62,21 @@ def capo_trend(days: int = 14) -> list[dict]:
     for r in rows:
         r["capo"] = round(r["tokens"] / r["accepted"], 1) if r["accepted"] else None
     return rows
+
+
+def raw_ledger(start_date: str | None = None, end_date: str | None = None) -> list[dict]:
+    """Raw ledger rows for the SQL-view / CSV export."""
+    sql = "SELECT * FROM token_ledger"
+    params = []
+    conditions = []
+    if start_date:
+        conditions.append("ts >= datetime(?)")
+        params.append(start_date)
+    if end_date:
+        conditions.append("ts <= datetime(?)")
+        params.append(end_date)
+    if conditions:
+        sql += " WHERE " + " AND ".join(conditions)
+    sql += " ORDER BY ts DESC LIMIT 1000"
+    with connect(TOKEN_DB) as c:
+        return [dict(r) for r in c.execute(sql, tuple(params)).fetchall()]

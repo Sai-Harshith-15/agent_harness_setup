@@ -26,7 +26,7 @@ def can_write(path: str, target_type: str, target: str, agent: str = "", task_id
         return Decision(False, f"path '{path}' is not an agent-writable log target")
     if target not in _ALLOWED_HEADING:
         return Decision(False, f"heading '{target}' is not in the writable allow-list")
-        
+
     # Phase 6.2: Lethal-trifecta / instruction-provenance combinatorial rule (P13)
     if agent and task_id:
         from ..db import CONTROL_DB, connect
@@ -34,5 +34,5 @@ def can_write(path: str, target_type: str, target: str, agent: str = "", task_id
             tools = {r["tool"] for r in c.execute("SELECT DISTINCT tool FROM audit_log WHERE task_id=?", (task_id,)).fetchall()}
             if "read_private" in tools and "read_untrusted" in tools:
                 return Decision(False, "lethal-trifecta: task has mixed private data with untrusted provenance")
-                
+
     return Decision(True, "ok")

@@ -2,13 +2,13 @@
 import { useEffect, useState } from "react";
 
 export default function Crash() {
-  const [data, setData] = useState<any>({ released_locks: [], hibernated_orphans: [] });
+  const [error, setError] = useState<string | null>(null);
 
   const load = () => {
     fetch("http://127.0.0.1:27180/dashboard/crashes")
-      .then(r => r.json())
-      .then(d => setData(d))
-      .catch(() => setData({ released_locks: [], hibernated_orphans: [] }));
+      .then(r => { if (!r.ok) throw new Error("Failed to load crashes"); return r.json(); })
+      .then(d => { setData(d); setError(null); })
+      .catch(e => { setData({ released_locks: [], hibernated_orphans: [] }); setError(e.message); });
   };
 
   useEffect(() => {
@@ -23,6 +23,7 @@ export default function Crash() {
   return (
     <main style={{ padding: 24 }}>
       <h1>Crash reconciliation</h1>
+      {error && <div style={{ color: "#ff7b72", padding: "12px 0" }}>Backend Error: {error}</div>}
       <h2 style={{ fontSize: 16 }}>Released locks (crash_recovery)</h2>
       <ul>
         {data.released_locks.map((l: any, i: number) => (

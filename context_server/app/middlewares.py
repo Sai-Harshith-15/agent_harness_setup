@@ -92,10 +92,37 @@ class DLPFilter:
     def scrub(text: str) -> str:
         if not isinstance(text, str):
             return text
-        text = re.sub(r'AKIA[0-9A-Z]{16}', '[REDACTED_AWS_KEY]', text)
-        text = re.sub(r'Bearer\s+[A-Za-z0-9\-\._~\+\/]+=*', 'Bearer [REDACTED_TOKEN]', text)
-        text = re.sub(r'ghp_[0-9a-zA-Z]{36}', '[REDACTED_GITHUB_PAT]', text)
-        text = re.sub(r'xox[baprs]-[0-9a-zA-Z\-]+', '[REDACTED_SLACK_TOKEN]', text)
-        text = re.sub(r'-----BEGIN PRIVATE KEY-----.*?-----END PRIVATE KEY-----', '[REDACTED_PRIVATE_KEY]', text, flags=re.DOTALL)
-        text = re.sub(r'\b[0-9a-zA-Z]{40,}\b', '[REDACTED_HIGH_ENTROPY]', text)
+
+        patterns = [
+            (r'AKIA[0-9A-Z]{16}', '[REDACTED_AWS_KEY]'),
+            (r'Bearer\s+[A-Za-z0-9\-\._~\+\/]+=*', 'Bearer [REDACTED_TOKEN]'),
+            (r'ghp_[0-9a-zA-Z]{36}', '[REDACTED_GITHUB_PAT]'),
+            (r'xox[baprs]-[0-9a-zA-Z\-]+', '[REDACTED_SLACK_TOKEN]'),
+            (r'-----BEGIN PRIVATE KEY-----.*?-----END PRIVATE KEY-----', '[REDACTED_PRIVATE_KEY]'),
+            (r'\b[0-9a-zA-Z]{40,}\b', '[REDACTED_HIGH_ENTROPY]')
+        ]
+
+        from .config import settings
+        
+        hit = False
+        original_text = text
+        for p, repl in patterns:
+            # Note: For multiline regex like private key, we need flags.
+            # We'll just apply DOTALL for the private key one.
+            flags = re.DOTALL if "PRIVATE KEY" in p else 0
+            if re.search(p, text, flags):
+                hit = True
+                text = re.sub(p, repl, text, flags=flags)
+
+        if hit:
+            policy = settings.dlp_hit_policy
+            if policy == "block":
+                raise HTTPException(status_code=403, detail="dlp_violation: sensitive data blocked")
+            elif policy == "quarantine":
+                # We would normally write to a quarantine table here, but for now we'll just block it
+                # returning 202 to the agent but aborting the actual write.
+                # Actually, raising an exception caught by a custom handler is cleaner,
+                # or we just raise 403 for now. Let's raise 403 to simulate quarantine abort.
+                raise HTTPException(status_code=403, detail="dlp_violation: content quarantined")
+                
         return text

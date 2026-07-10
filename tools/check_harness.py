@@ -17,10 +17,20 @@ def _read(p: str) -> str:
 def check() -> list[str]:
     errors: list[str] = []
 
-    for required in ["AGENTS.md", "PLAN.md", "IMPLEMENT.md", "HARNESS_CHECKLIST.md",
-                     "contracts/obsidian_backend.md", "okf/log.md", "okf/SPEC.md"]:
-        if not _read(required):
+    required_files = [
+        "AGENTS.md", "PLAN.md", "IMPLEMENT.md", "HARNESS_CHECKLIST.md",
+        "contracts/obsidian_backend.md", "contracts/sandbox_driver.md",
+        "contracts/dlp.md", "contracts/mcp_tools.md", "contracts/observability.md", "contracts/occ.md",
+        "okf/log.md", "okf/SPEC.md"
+    ]
+    
+    for required in required_files:
+        content = _read(required)
+        if not content:
             errors.append(f"missing required file: {required}")
+        # Phase 3.4 Harness Validator Depth: Enforce contracts are fleshed out
+        if required.startswith("contracts/") and len(content) < 300:
+            errors.append(f"contract {required} is too thin (under 300 bytes), must be fleshed out")
 
     # exactly one orchestrator in the registry
     orchestrators = []
@@ -65,7 +75,7 @@ def check() -> list[str]:
 
     # Test-green gate
     try:
-        subprocess.check_call([sys.executable, "-m", "pytest", "context_server/tests/"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=ROOT)
+        subprocess.check_call([sys.executable, "-m", "pytest", "context_server/tests/"], cwd=ROOT)
     except subprocess.CalledProcessError:
         errors.append("pytest suite failed (all tests must be green)")
 
