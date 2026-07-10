@@ -7,14 +7,19 @@ from ..db import CONTROL_DB, audit, connect
 from .hibernation import thaw
 
 
-def reconcile() -> dict:
+def reconcile(startup: bool = False) -> dict:
     now = datetime.now(timezone.utc)
     reaped = []
+    crashes = []
     rejected_hitl = []
     with connect(CONTROL_DB) as c:
         for row in c.execute("SELECT * FROM locks").fetchall():
-            if datetime.fromisoformat(row["lease_expires_at"]) <= now:
-                reaped.append({"resource": row["resource"], "was": f"{row['agent']}:{row['task_id']}"})
+            is_expired = datetime.fromisoformat(row["lease_expires_at"]) <= now
+            if startup or is_expired:
+                if startup:
+                    crashes.append({"resource": row["resource"], "was": f"{row['agent']}:{row['task_id']}"})
+                else:
+                    reaped.append({"resource": row["resource"], "was": f"{row['agent']}:{row['task_id']}"})
                 c.execute("DELETE FROM locks WHERE resource=?", (row["resource"],))
 
         try:
@@ -29,7 +34,23 @@ def reconcile() -> dict:
 
         orphans = [dict(r) for r in c.execute("SELECT * FROM hibernation").fetchall()]
     for r in reaped:
-        audit("system", "crash-reconcile", "release_lock", True, f"{r['resource']} released:crash_recovery")
+        audit("system", "crash-reconcile", "release_lock", True, f"{r['resource']} released:ttl_expiry")
+    for r in crashes:
+        audit("system", "crash-reconcile", "release_lock", False, f"{r['resource']} released:infrastructure_crash")
     for r_id in rejected_hitl:
         audit("system", "crash-reconcile", "hitl_expire", True, f"hitl item {r_id} auto-expired")
-    return {"released_locks": reaped, "hibernated_orphans": orphans, "rejected_hitl": rejected_hitl}
+        
+    if startup and crashes:
+        import os, re
+        root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        plan_path = os.path.join(root, "PLAN.md")
+        if os.path.exists(plan_path):
+            with open(plan_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            # finalize in-progress rows
+            content = re.sub(r"- \[in-progress\]", "- [crash]", content)
+            content = re.sub(r"- \[delegated\]", "- [crash]", content)
+            with open(plan_path, "w", encoding="utf-8") as f:
+                f.write(content)
+
+    return {"released_locks": reaped, "crashes": crashes, "hibernated_orphans": orphans, "rejected_hitl": rejected_hitl}

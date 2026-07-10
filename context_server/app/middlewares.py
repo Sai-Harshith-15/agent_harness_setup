@@ -1,7 +1,6 @@
 """Context Server policy middlewares (Phases 2.9 - 2.13)."""
 import re
 import time
-from collections import defaultdict
 
 from fastapi import HTTPException, Request
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -69,19 +68,21 @@ class PolicyMiddleware(BaseHTTPMiddleware):
         with connect(CONTROL_DB) as c:
             if response.status_code >= 500:
                 now_ts = time.time()
-                c.execute("""
-                    INSERT INTO breaker_state (agent, tool, consecutive_failures, last_trip_time) 
-                    VALUES (?, ?, 1, ?) 
-                    ON CONFLICT(agent, tool) 
-                    DO UPDATE SET consecutive_failures = consecutive_failures + 1, last_trip_time = ?
-                """, (agent, tool, now_ts, now_ts))
+                c.execute(
+                    "INSERT INTO breaker_state (agent, tool, consecutive_failures, last_trip_time) "
+                    "VALUES (?, ?, 1, ?) "
+                    "ON CONFLICT(agent, tool) "
+                    "DO UPDATE SET consecutive_failures = consecutive_failures + 1, last_trip_time = ?",
+                    (agent, tool, now_ts, now_ts)
+                )
             else:
-                c.execute("""
-                    INSERT INTO breaker_state (agent, tool, consecutive_failures, last_trip_time) 
-                    VALUES (?, ?, 0, 0) 
-                    ON CONFLICT(agent, tool) 
-                    DO UPDATE SET consecutive_failures = 0
-                """, (agent, tool))
+                c.execute(
+                    "INSERT INTO breaker_state (agent, tool, consecutive_failures, last_trip_time) "
+                    "VALUES (?, ?, 0, 0) "
+                    "ON CONFLICT(agent, tool) "
+                    "DO UPDATE SET consecutive_failures = 0",
+                    (agent, tool)
+                )
 
         return response
 

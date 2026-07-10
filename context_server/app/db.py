@@ -1,8 +1,8 @@
 """The two SQLite stores. WAL mode so the frontend can read while the server writes."""
 import os
 import sqlite3
-from contextlib import contextmanager
 import threading
+from contextlib import contextmanager
 
 from .config import settings
 

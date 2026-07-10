@@ -4,7 +4,7 @@ only by the orchestrator via accept_implement (Phase 3), which is the CAPO numer
 from ..db import TOKEN_DB, connect
 
 
-def record(agent: str, task_id: str, tool: str, tokens_in: int, tokens_out: int,
+def record(agent: str, task_id: str, tool: str, tokens_in: int = 0, tokens_out: int = 0,
            accepted: bool = False) -> None:
     with connect(TOKEN_DB) as c:
         c.execute(

@@ -24,9 +24,8 @@ def _now() -> datetime:
 def acquire_lock(resource: str, agent: str, task_id: str) -> None:
     # First, check if adding this dependency creates a deadlock
     visited = set()
-    current_task = task_id
     current_resource = resource
-    
+
     while current_resource:
         with connect(CONTROL_DB) as c:
             row = c.execute("SELECT task_id, lease_expires_at FROM locks WHERE resource=?", (current_resource,)).fetchone()
@@ -53,7 +52,7 @@ def acquire_lock(resource: str, agent: str, task_id: str) -> None:
                 _task_waiting_on[task_id] = resource
                 raise HTTPException(status_code=409,
                                     detail=f"resource locked by {row['agent']}:{row['task_id']}")
-        
+
         # Lock acquired, clear waiting state if any
         _task_waiting_on.pop(task_id, None)
         exp = (_now() + timedelta(seconds=LEASE_SECONDS)).isoformat()

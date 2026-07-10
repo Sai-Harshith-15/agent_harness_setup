@@ -4,21 +4,19 @@ import os
 import re
 from contextlib import asynccontextmanager
 from datetime import datetime, time, timedelta
-
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from pydantic import BaseModel
 from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-from opentelemetry.sdk.resources import Resource
-from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-
+from pydantic import BaseModel
 from .config import settings
 from .db import CONTROL_DB, audit, connect, init_db
 from .delegation import delegate_task as _delegate_task
-from .finops.meter import mark_accepted
+from .finops.meter import mark_accepted, record as meter_record
 from .finops.rollups import capo, capo_trend, heatmap, totals_by_task
 from .finops.standup import post_standup
 from .governance.hibernation import hibernate, thaw
@@ -95,7 +93,7 @@ async def _dream_loop():
 async def lifespan(app: FastAPI):
     init_db()
     init_hitl()
-    print("[boot] crash reconciliation:", reconcile())   # reap crash-orphaned leases
+    print("[boot] crash reconciliation:", reconcile(startup=True))   # reap crash-orphaned leases
     asyncio.create_task(_daily_standup_loop())
     asyncio.create_task(_dream_loop())
     # ENABLE_WATCHER defaults to true; tests set it to 'false' so the
@@ -216,6 +214,7 @@ async def search_notes(body: SearchBody, ident: AgentIdentity = Depends(require_
                 if "content" in results[i]:
                     results[i]["content"] = DLPFilter.scrub(results[i]["content"])
         notify_audit(ident.agent, ident.task_id, "search_notes", True, f"{len(results)} hits")
+        meter_record(ident.agent, ident.task_id, "search_notes")
         return {"results": results}
     except Exception as e:
         notify_audit(ident.agent, ident.task_id, "search_notes", False, str(e))
@@ -229,6 +228,7 @@ async def read_note(path: str, ident: AgentIdentity = Depends(require_identity))
             note["version_hash"] = hashlib.sha256((note["content"] or "").encode("utf-8")).hexdigest()
             note["content"] = DLPFilter.scrub(note["content"])
         notify_audit(ident.agent, ident.task_id, "read_note", True, path)
+        meter_record(ident.agent, ident.task_id, "read_note")
         return note
     except Exception as e:
         notify_audit(ident.agent, ident.task_id, "read_note", False, str(e))
@@ -236,7 +236,7 @@ async def read_note(path: str, ident: AgentIdentity = Depends(require_identity))
 
 @app.post("/mcp/append_implement")
 async def append_implement(body: GovernedAppendBody, ident: AgentIdentity = Depends(require_identity)):
-    decision = can_write(body.path, "heading", body.target)   # permission matrix
+    decision = can_write(body.path, "heading", body.target, ident.agent, ident.task_id)   # permission matrix
     if not decision.allowed:
         notify_audit(ident.agent, ident.task_id, "append_implement", False, f"DENY: {decision.reason}")
         raise HTTPException(status_code=403, detail=decision.reason)
@@ -250,6 +250,7 @@ async def append_implement(body: GovernedAppendBody, ident: AgentIdentity = Depe
             await backend.patch(body.path, "heading", body.target, scrubbed_content,
                                 reject_if_preexists=True)         # idempotent write
             notify_audit(ident.agent, ident.task_id, "append_implement", True, f"{body.path}#{body.target}")
+            meter_record(ident.agent, ident.task_id, "append_implement")
             return {"ok": True}
         except HTTPException:
             raise
@@ -259,7 +260,7 @@ async def append_implement(body: GovernedAppendBody, ident: AgentIdentity = Depe
 
 @app.post("/mcp/log_decision")
 async def log_decision(body: GovernedAppendBody, ident: AgentIdentity = Depends(require_identity)):
-    decision = can_write(body.path, "heading", body.target)   # permission matrix
+    decision = can_write(body.path, "heading", body.target, ident.agent, ident.task_id)   # permission matrix
     if not decision.allowed:
         notify_audit(ident.agent, ident.task_id, "log_decision", False, f"DENY: {decision.reason}")
         raise HTTPException(status_code=403, detail=decision.reason)
@@ -273,6 +274,7 @@ async def log_decision(body: GovernedAppendBody, ident: AgentIdentity = Depends(
             await backend.patch(body.path, "heading", body.target, scrubbed_content,
                                 reject_if_preexists=True)         # idempotent write
             notify_audit(ident.agent, ident.task_id, "log_decision", True, f"{body.path}#{body.target}")
+            meter_record(ident.agent, ident.task_id, "log_decision")
             return {"ok": True}
         except HTTPException:
             raise
@@ -291,6 +293,39 @@ async def accept_implement(body: AcceptBody, ident: AgentIdentity = Depends(requ
     if ident.agent != orchestrator_id():
         raise HTTPException(status_code=403, detail="Only the orchestrator may accept IMPLEMENT rows")
     mark_accepted(body.task_id)
+    
+    # Phase 6.3: physically append the accepted row to IMPLEMENT.md
+    import datetime
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    plan_path = os.path.join(root, "PLAN.md")
+    title = body.row_id
+    agent = ident.agent
+    phase = body.row_id.split("-")[0].replace("P", "") if "-" in body.row_id else "?"
+    if os.path.exists(plan_path):
+        for line in open(plan_path, encoding="utf-8"):
+            m = _PLAN_ROW.match(line.strip())
+            if m and m.group("id") == body.row_id:
+                title = m.group("title")
+                agent = m.group("agent")
+                break
+                
+    impl_path = os.path.join(root, body.path)
+    if os.path.exists(impl_path):
+        with open(impl_path, "r", encoding="utf-8") as f:
+            lines = f.read().split("\n")
+        out_lines = []
+        inserted = False
+        new_row = f"| {phase} | {body.row_id} | {title} | {agent} | true | {datetime.datetime.now().strftime('%Y-%m-%d')} |"
+        for line in lines:
+            if line.startswith("---") and not inserted and any("| phase |" in l for l in out_lines):
+                out_lines.append(new_row)
+                inserted = True
+            out_lines.append(line)
+        if not inserted:
+            out_lines.append(new_row)
+        with open(impl_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(out_lines))
+            
     notify_audit(ident.agent, ident.task_id, "accept_implement", True, f"{body.path}#{body.row_id}")
     return {"ok": True, "accepted": body.row_id}
 
@@ -300,6 +335,20 @@ async def request_clarification(body: ClarifyBody, ident: AgentIdentity = Depend
               frozen_state={"question": body.question, "diff": body.proposed_diff})
     item_id = enqueue(ident.task_id, ident.agent, body.question, body.proposed_diff)
     notify_audit(ident.agent, ident.task_id, "request_clarification", True, f"queued #{item_id}")
+    
+    # Route to orchestrator in the background (Phase 6.5)
+    import asyncio
+    from .registry import lookup_agent, orchestrator_id
+    from .adapters import adapter_for
+    orch_meta = lookup_agent(orchestrator_id())
+    if orch_meta:
+        async def _notify():
+            try:
+                await adapter_for(orch_meta).run(ident.task_id, f"HITL Clarification from {ident.agent}: {body.question}", orch_meta)
+            except Exception:
+                pass
+        asyncio.create_task(_notify())
+        
     return {"paused": True, "hitl_item": item_id}
 
 @app.get("/dashboard/hitl")
@@ -339,6 +388,7 @@ async def dashboard_capo():
 async def post_standup_ep(ident: AgentIdentity = Depends(require_identity)):
     result = await post_standup()
     audit(ident.agent, ident.task_id, "post_standup", True, result["path"])
+    meter_record(ident.agent, ident.task_id, "post_standup")
     return result
 
 @app.websocket("/dashboard/tokens/ws")
@@ -360,6 +410,7 @@ async def tokens_ws(ws: WebSocket):
 async def reindex(ident: AgentIdentity = Depends(require_identity)):
     stats = graphify()
     audit(ident.agent, ident.task_id, "reindex", True, str(stats))
+    meter_record(ident.agent, ident.task_id, "reindex")
     return stats
 
 
@@ -368,6 +419,7 @@ async def compress(budget_tokens: int = 4000, ident: AgentIdentity = Depends(req
     result = compact(budget_tokens)
     audit(ident.agent, ident.task_id, "compress", True,
           f"kept={len(result['kept'])} collapsed={result['collapsed_nodes']}")
+    meter_record(ident.agent, ident.task_id, "compress")
     return result
 
 
@@ -423,6 +475,8 @@ async def run_dream_cycle_ep(ident: AgentIdentity = Depends(require_identity)):
     result = await run_dream_cycle()
     audit(ident.agent, ident.task_id, "run_dream_cycle", result["ok"],
           f"{len(result.get('proposals', []))} proposals")
+    if result["ok"]:
+        meter_record(ident.agent, ident.task_id, "run_dream_cycle")
     return result
 
 

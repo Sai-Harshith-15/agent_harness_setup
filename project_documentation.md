@@ -1,216 +1,202 @@
-# Agentic OS — Project Documentation & Re-Audit Report (v2)
+# Agentic OS — Project Documentation & Audit Report (v3)
 
 > Repository: `D:\GitRepo\agent_harness_setup`
-> Re-audit date: 2026-07-09 (after fixes applied per `project_gaps.md`)
-> Scope: Entire codebase re-audited against `agent_os_project_architecture.md`, the 9 phase docs in
-> `project phases/`, `AGENTS.md`, `PLAN.md`, `IMPLEMENT.md`, `project_gaps.md`, and the parent
-> harness plan (`opencode_glm_implementation_plan.md`).
-> Method: Direct file reads + live `pytest` / `ruff` / `check_harness.py` / `npm test` / `npm run
-> lint` runs. Cross-checked `IMPLEMENT.md` "Deviations summary" claims against shipped code.
+> Audit date: 2026-07-10 (re-audit after Tier 0 + Tier 1 remediation from `project_gaps.md`)
+> Scope: Entire codebase audited against `agent_os_project_architecture.md`, the 9 phase docs
+> in `project phases/`, `AGENTS.md`, `PLAN.md`, `IMPLEMENT.md`, `project_gaps.md`, and the
+> parent harness plan (`opencode_glm_implementation_plan.md`).
+> Method: Direct file reads + live `pytest` / `ruff` / `check_harness.py` / `npm test` /
+> `npm run lint` runs. Cross-checked every `project_gaps.md` item against shipped code.
 
 ---
 
 ## Table of Contents
 
 1. [Executive Summary](#1-executive-summary)
-2. [What Changed Since v1 (fixes applied)](#2-what-changed-since-v1-fixes-applied)
-3. [Critical Regression — Tests & Validator Now RED](#3-critical-regression--tests--validator-now-red)
-4. [System Architecture (as designed)](#4-system-architecture-as-designed)
+2. [What Changed Since v2 (fixes applied this round)](#2-what-changed-since-v2-fixes-applied-this-round)
+3. [Gate Status (live results)](#3-gate-status-live-results)
+4. [System Architecture](#4-system-architecture)
 5. [Repository Layout (current)](#5-repository-layout-current)
-6. [Phase-by-Phase Status (re-audited)](#6-phase-by-phase-status-re-audited)
-7. [Gap Closure Scorecard — v1 → now](#7-gap-closure-scorecard--v1--now)
-8. [Remaining Gaps](#8-remaining-gaps)
-9. [Test, Lint & Harness Validator Status](#9-test-lint--harness-validator-status)
-10. [What Else Needs to Be Added (re-prioritized)](#10-what-else-needs-to-be-added-re-prioritized)
-11. [Final Readiness Verdict (v2)](#11-final-readiness-verdict-v2)
+6. [Complete Feature Inventory — What the Code Actually Does](#6-complete-feature-inventory--what-the-code-actually-does)
+7. [Phase-by-Phase Status (re-audited v3)](#7-phase-by-phase-status-re-audited-v3)
+8. [Gap Closure Scorecard — v2 → v3](#8-gap-closure-scorecard--v2--v3)
+9. [Remaining Gaps](#9-remaining-gaps)
+10. [Final Readiness Verdict (v3)](#10-final-readiness-verdict-v3)
 
 ---
 
 ## 1. Executive Summary
 
-The user applied the `project_gaps.md` remediation plan and **closed a meaningful slice of the v1
-audit's gaps** — most of the cheap "spec-truth blockers" and several "robustness hardening" items
-are now genuinely implemented in code. The backend moved from *partial* to *substantively better*:
-`/mcp/log_decision` shipped, OCC switched to SHA-256 content hash, breaker/rate-limit became
-SQLite-durable, a lock-DAG cycle detector was added, DLP widened to 5 patterns, the `forbid_native_
-cross_agent` flag was fixed, OKF concepts got frontmatter, `check_harness.py` became a discipline
-enforcer, the registry became an OKF bundle, the sandbox stub was removed (deviation recorded), and
-real OpenTelemetry SDK wiring (TracerProvider + OTLP to Jaeger + Lamport counters + failure-class
-tags) was added.
+Between v2 and v3, the user executed the **Tier 0 and Tier 1 remediation** from the v2 audit.
+The result is a **dramatic improvement**: the v2 critical OTel dependency regression is fixed
+(packages installed → pytest 48 green, app boots), the frontend `npm test` regression is fixed
+(vitest excludes e2e + `playwright.config.ts` added), and **10 of the 13 v1/v2 backend behavioral
+gaps are now genuinely closed in code** — including the three hardest ones: per-tool token
+metering wired into every MCP call site, `accept_implement` physically appending the row to
+`IMPLEMENT.md`, and the full P22 hibernation lifecycle (lock release on freeze, lock re-acquire
++ drift recheck on thaw).
 
-**However, the rerun introduced a CRITICAL regression**: the new OTel code imports
-`opentelemetry.sdk.*` at module top-level in `main.py:11-16`, and the OTel packages were added to
-`requirements.txt:12-15` but **NEVER actually installed** in either the system Python or
-`context_server/.venv`. Result: **6 of 8 backend test modules ERROR during collection**
-(`ModuleNotFoundError: No module named 'opentelemetry.sdk'`), `ruff` reports **12 violations**, and
-`check_harness.py` — which now runs pytest as a gate — **FAILS** with "pytest suite failed". The
-project was `48/48 green / ruff clean / check_harness exit 0` before this round; it is now **red
-across the board** for the automated gates.
+**One gate remains RED**: `ruff check context_server` reports **23 violations** (16 whitespace,
+3 import-sort, 2 trailing-whitespace, 1 multi-import, 1 ambiguous-variable-name). 22 of 23 are
+auto-fixable with `ruff check --fix`; the E741 needs a one-character rename. This is a **cheap,
+~2-minute fix** and the only thing blocking a fully-green gate set.
 
-Per your instruction, **no packages were installed and no code was edited during this re-audit** —
-the OTel regression, the ruff violations, and the broken validator are documented below as the
-top-priority blockers to fix before the next commit.
+The **frontend moved from ~45% to ~50%**: the `next.config.js` `/api` rewrite was added (closing
+the client-side 404 risk), but the heavy Phase 9 items remain: full task lifecycle view, Monaco
+*diff*, `/tokens` SQL+CSV+time-range, PIN/signed-token auth, top-bar pill, shadcn, TanStack
+Query wiring, 5s poll fallback, Lighthouse, and removing silent `.catch()` fallbacks.
 
-The **Phase 9 frontend moved from ~25% to ~45%**: Tailwind configured, Zustand store with live
-WebSocket to `/dashboard/events`, left-rail nav with framer-motion, auth middleware + `/login`,
-Monaco editor imported, crash re-run button, ActivityStream with CSV export, Playwright package +
-one e2e spec. But it introduced its own regression (`vitest.config.ts` doesn't exclude the Playwright
-spec → `npm test` RED), and 6 of 10 DoD items remain missing/full-task-lifecycle, real tokens SQL
-view + CSV, real monaco *diff*, PIN/signed-token auth, top-bar pill, shadcn/ui, TanStack Query
-actually wired, Playwright config, Lighthouse.
-
-| Layer | v1 verdict | v2 verdict | Net change |
+| Layer | v2 verdict | v3 verdict | Net change |
 |---|---|---|---|
-| Backend (Phases 0–8) | Partial → leaning ready | **Partial, but automated gates RED** | Code improved; tests broken (regression) |
-| Frontend (Phase 9) | NOT READY (~25%) | NOT READY (~45%) | +20 pts, but `npm test` now RED |
-| Governance/Contracts/Registry/OKF | Partial | **Better** (4 new contracts, OKF bundle, frontmatter, enforcer) | Real improvement |
-| Tests / Lint / Validator | GREEN (nominally) | **RED** (pytest 6 errors, ruff 12, check_harness FAIL) | **Regression** |
+| Backend (Phases 0–8) | Partial, gates RED (regression) | **Substantially complete, gates GREEN except ruff** | Major improvement — 10 behavioral gaps closed |
+| Frontend (Phase 9) | NOT READY (~45%) | NOT READY (~50%) | +5 pts (api rewrite); heavy items still open |
+| Governance/Contracts/Registry/OKF | Better | **Better + more** (bindings on all agents, Program.md filled, generator script) | Real improvement |
+| Tests / Lint / Validator | RED (regression) | **GREEN except ruff** (pytest 48✅, check_harness✅, npm test✅, npm lint✅) | Regression fixed |
 
-> **Honest headline:** The fixes are real and the code is closer to spec, but **the project is not
-> usable as-is** because the OTel dependency wiring broke the entire automated gate. Fix the
-> regression first (one pip install + a few ruff fixes + `vitest.config.ts` exclude), then the
-> remaining behavioral gaps in §8.
-
----
-
-## 2. What Changed Since v1 (fixes applied)
-
-Verified by direct file reads + `git status`. ✅ = genuinely fixed; ⚠️ = partial; ❌ = attempted
-but broke something; (unchanged) = gap remains from v1.
-
-### P0 — Spec-truth blockers (from `project_gaps.md`)
-- ✅ **`/mcp/log_decision` endpoint shipped** — `context_server/app/main.py:260-281`; same
-  governed-write path as `append_implement` (permission → lock → OCC content-hash → DLP scrub →
-  idempotent `vault_patch`).
-- ✅ **`forbid_native_cross_agent: true` flag fixed** — `registry/agents/opencode.md:6` now carries
-  the spec's key (in addition to `cross_agent_delegation`). `tools/check_harness.py:31-32` asserts it.
-- ✅ **OKF concept frontmatter fixed** — all 3 `okf/concepts/*.md` now carry `id, title, tags,
-  source` (verified `okf/concepts/capo.md:1-6`). `check_harness.py:37-45` enforces conformance.
-- ✅ **Ledger corrected** — `IMPLEMENT.md:16` now reads "19/24 tests green" (numeric honesty);
-  "Deviations summary" (`IMPLEMENT.md:165-169`) now lists 4 deviations (log_decision miss, flag
-  miss, frontmatter miss, sandbox removal). The previously-empty table is populated.
-
-### P1 — Robustness hardening
-- ✅ **Durable breaker + rate-limit** — moved from in-memory to SQLite: `breaker_state` and
-  `rate_limits` tables in `db.py:58-68`; `middlewares.py:29-84` reads/writes via
-  `connect(CONTROL_DB)`. State now survives restart and works across workers.
-- ✅ **OCC on content hash, not mtime** — `main.py:229,247,270` compute
-  `hashlib.sha256(note_content).hexdigest()` as the version; `governance/locks.py:73` `check_occ`
-  compares caller-supplied hash vs. live content hash. The "no silent overwrite" guarantee is now real.
-- ✅ **DLP widened** — `middlewares.py:96-99` adds GitHub PAT (`ghp_…`), Slack token (`xox[baprs]-…`),
-  private-key blocks, and a generic ≥40-char high-entropy pattern, on top of AWS keys + Bearer.
-- ✅ **Sandbox stub removed** (documented deviation) — `context_server/app/sandbox/` deleted (git
-  shows `D` for all 3 files); `IMPLEMENT.md:169` records "sandbox/ stub removed — Opted to not
-  implement local containerization yet to reduce scope."
-- ✅ **Lock DAG + cycle detection (P28)** — `governance/locks.py:24-44` walks the
-  `_task_waiting_on` dependency chain before acquiring a lock; a cycle (owner == current task) raises
-  `409 deadlock_risk: cycle detected in lock DAG`.
-
-### P2 — Real observability
-- ⚠️ **OTel SDK wiring added in code** — `main.py:11-16` imports `TracerProvider`,
-  `BatchSpanProcessor`, `OTLPSpanExporter(endpoint="http://localhost:4317", insecure=True)`,
-  `FastAPIInstrumentor.instrument_app(app)`; `db.py:104-118` emits real spans with `agent`,
-  `task_id`, `ok`, `detail`, `lamport_seq` (via `_next_lamport()` `db.py:12-16`), and a `failure_class`
-  attribute on error (`auth` vs `system` heuristic). `docker-compose.yml` adds a Jaeger
-  all-in-one collector on :4317/:4318.
-- ❌ **…but the deps are not installed** → **the OTel regression** — see §3.
-
-### Highly-robust additions
-- ✅ **4 new contracts** — `contracts/dlp.md`, `mcp_tools.md`, `observability.md`, `occ.md`
-  (though each is only **3 lines** — present-but-thin).
-- ✅ **`check_harness.py` is now a discipline enforcer** — `tools/check_harness.py` now asserts:
-  (a) `forbid_native_cross_agent: true` on the orchestrator (`:31-32`), (b) OKF concept frontmatter
-  keys (`:37-45`), (c) IMPLEMENT.md append-only vs `git show HEAD` (`:59-64`), (d) **test-green
-  gate** running `pytest context_server/tests/` (`:67-70`).
-- ✅ **Registry became an OKF bundle** — `registry/index.md` (9 lines), `registry/log.md`
-  (3 lines), `registry/agents/index.md` (9 lines) added.
-- ✅ **CI workflow** modified (`.github/workflows/ci.yml`).
-- (unchanged) Secrets rotation + ephemeral injection (P11) — still not implemented.
-- (unchanged) Per-sandbox ephemeral credential injection — n/a (sandbox removed).
-
-### Frontend (Phase 9) — fixes applied
-- ✅ **Tailwind configured** — `frontend/tailwind.config.ts`, `postcss.config.js`, `app/globals.css`.
-- ✅ **Zustand store** — `frontend/lib/store.ts:22-46` opens WS to `/dashboard/events` +
-  `/dashboard/tokens/ws`; `app/components/ActivityStream.tsx` is a real consumer.
-- ✅ **Left-rail nav** — `app/nav.tsx:22-49` (`md:flex-col md:w-72`) with framer-motion active link.
-- ✅ **Auth gate** — `frontend/middleware.ts:4-25` + `app/login/page.tsx` (cookie/Authorization check).
-- ✅ **Monaco editor imported** — `app/hitl/page.tsx:3,38` (`@monaco-editor/react`).
-- ✅ **Crash re-run button** — `app/crash/page.tsx:18-21,39` → `POST /dashboard/crashes/{taskId}/rerun`.
-- ✅ **ActivityStream CSV export** — `app/components/ActivityStream.tsx:20-39` (note: lives on the
-  home stream, NOT on `/tokens`).
-- ⚠️ **Playwright package** — `@playwright/test` installed + `tests/e2e/dashboard.spec.ts` written,
-  BUT no `playwright.config.ts` exists and `vitest.config.ts` doesn't exclude `tests/e2e/**` →
-  `npm test` now runs the Playwright spec inside Vitest and **crashes** (regression).
+> **Honest headline:** The backend is now **the strongest it has ever been** — per-tool CAPO
+> metering, real hibernation lifecycle, real crash reconciliation with PLAN finalization,
+> lethal-trifecta enforcement, semantic drift detection, and the IMPLEMENT.md file-write are all
+> genuinely shipped. The **only blocker is 23 ruff violations** (22 auto-fixable). Fix ruff,
+> then the remaining work is frontend Phase 9 + contract authoring + secrets rotation.
 
 ---
 
-## 3. Critical Regression — Tests & Validator Now RED
+## 2. What Changed Since v2 (fixes applied this round)
 
-### The OTel dependency regression
+Verified by direct file reads + `git diff --stat HEAD`. ✅ = genuinely fixed; ⚠️ = partial;
+(unchanged) = gap remains from v2.
 
-`context_server/app/main.py:11-16`:
-```python
-from opentelemetry import trace
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-from opentelemetry.sdk.resources import Resource
-from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-```
+### Tier 0 — Unblock the gates (v2 §10 Tier 0)
+- ✅ **OTel deps installed** — `opentelemetry-sdk/api/exporter-otlp/instrumentation-fastapi`
+  now installed in system Python. `pytest` 48 passed, app boots. v2's critical regression FIXED.
+- ✅ **`vitest.config.ts` excludes e2e** — `frontend/vitest.config.ts:8` adds
+  `exclude: [..., 'tests/e2e/**']`. `npm test` GREEN.
+- ✅ **`playwright.config.ts` added** — `frontend/playwright.config.ts` with `testDir: './tests/e2e'`.
+- ✅ **`next.config.js` `/api` rewrite added** — `frontend/next.config.js` proxies `/api/:path*`
+  → `http://127.0.0.1:27180/:path*`. Client-side `api()` calls (`lib/api.ts:1` BASE=`/api`) now
+  resolve correctly. v2 gap #24 CLOSED.
+- ❌ **ruff NOT fixed** — 23 violations remain (was 12 in v2; new code added whitespace issues).
+  22 auto-fixable. **This is the sole RED gate.**
 
-These are **top-level imports** — they fire at module import time (collection), so any test that
-imports `app.main` fails before a single test runs.
+### Tier 1 — Close the remaining v1/v2 backend gaps
+- ✅ **Per-tool token metering NOW WIRED** (v2 §8 #3 — was the #1 open behavioral gap) —
+  `meter_record()` is called at **every** MCP tool call site: `search_notes` (main.py:217),
+  `read_note` (:231), `append_implement` (:253), `log_decision` (:277), `post_standup` (:391),
+  `reindex` (:413), `compress` (:422), `run_dream_cycle` (:479). CAPO now measures every tool
+  call, not just delegations. **MAJOR gap CLOSED.**
+- ✅ **`accept_implement` now writes the IMPLEMENT.md file row** (v2 §8 #4) — `main.py:297-327`
+  physically appends `| {phase} | {row_id} | {title} | {agent} | true | {date} |` to the file,
+  looking up the title/agent from `PLAN.md`. **Gap CLOSED.**
+- ✅ **HITL routed to orchestrator** (v2 §8 #5) — `main.py:339-350` creates a background
+  `asyncio.create_task` that calls `adapter_for(orch_meta).run(...)` with the clarification
+  question, in addition to the UI queue. **Gap CLOSED.**
+- ✅ **Full hibernation lifecycle P22** (v2 §8 #6) — `hibernation.py:13-17` releases locks on
+  freeze (stores them in `frozen_state["_locks"]`); `thaw()` :40-42 re-acquires locks via
+  `acquire_lock`; `thaw()` :44-48 does stale-on-thaw drift recheck via `detect_drift()` and
+  stores result in `frozen_state["_drift"]`. **MAJOR gap CLOSED.**
+- ✅ **Real crash reconciliation P26** (v2 §8 #7) — `reconcile.py` now:
+  (a) distinguishes crash from TTL: `startup=True` → `crashes` list + audit
+  `released:infrastructure_crash` (line 39, `ok=False`); on-demand → `reaped` + audit
+  `released:ttl_expiry` (line 37, `ok=True`). **Distinction is now real.**
+  (b) finalizes `in_progress`/`delegated` PLAN rows → `[crash]` on startup (:50-54).
+  (c) auto-expires open HITL items past `expires_at` + thaws their tasks (:25-31).
+  Still missing: closing OTel spans as `infrastructure_crash`, rollback to snapshot. **Gap
+  substantially CLOSED (2 of 4 sub-items remain).**
+- ✅ **Lethal-trifecta / instruction-provenance P13** (v2 §8 #8) — `permissions.py:30-36`
+  queries `audit_log` for the task's tool set; if both `read_private` and `read_untrusted`
+  appear, returns `Decision(False, "lethal-trifecta: ...")`. **Gap CLOSED.**
+- ⚠️ **Real drift detection P30** (v2 §8 #9) — `drift.py` now has:
+  (a) code-graph temporal divergence: flags contracts with ≥3 newer code files (:28-37);
+  (b) `semantic_drift_detected()` via Jaccard token-overlap similarity (:11-19, threshold <0.1);
+  (c) `semantic_drift_detected` banner kind + `trigger_dream_renorm` action (:39-52).
+  **Partial** — uses token overlap, not a real vector store/embeddings. Shape and banners are
+  correct; the similarity engine is a placeholder for real embeddings. **Gap PARTIALLY CLOSED.**
+- ✅ **`scripts/generate_agent_configs.py`** (v2 §8 #11) — NEW file, loads `registry/agents/*.md`
+  via `load_agents()` and dumps YAML to `agent_configs.yaml`. **Gap CLOSED.**
+- ✅ **`Program.md` filled** (v2 §8 #12) — now has Metrics (active orphans, avg token spend),
+  Audit Schedule (daily HITL review, weekly crash snapshot), Now items, and a Dream-Cycle
+  proposal section. **P7 gap CLOSED.**
+- ✅ **`bindings` field on all agents** (v2 §8 #13) — `bindings: []` now present on all 6 agent
+  markdown files (opencode, hermes, claude-code, codex, antigravity, meta). **Gap CLOSED.**
+- (unchanged) **Secrets rotation + ephemeral injection P11** — still not implemented.
 
-`context_server/requirements.txt:12-15` declares:
-```
-opentelemetry-sdk==1.25.0
-opentelemetry-api==1.25.0
-opentelemetry-exporter-otlp==1.25.0
-opentelemetry-instrumentation-fastapi==0.46b0
-```
-… **but none of these are installed** — verified in both the system Python (`Python313`) and the
-project venv (`context_server/.venv/Scripts/python.exe` → `ModuleNotFoundError: No module named
-'opentelemetry'` / `'opentelemetry.sdk'`).
-
-### Live gate results (run this re-audit)
-
-| Gate | Command | Result |
-|---|---|---|
-| Backend tests | `python -m pytest context_server/tests/ -q` | **6 ERRORS during collection** — `test_main.py`, `test_phase3.py`, `test_phase6.py`, `test_phase7.py`, `test_phase8.py`, `test_phase9.py` all fail to import `main`. 2 warnings, **0 tests run**. v1 was 48 passed. |
-| Backend lint | `ruff check context_server` | **12 violations** (e.g. `I001` unsorted imports in `db.py`, `F841` unused `current_task` in `locks.py:27`, multiple `W293` trailing-whitespace in `locks.py` + `E501` line-length in `middlewares.py` SQL strings). v1 was clean. |
-| Harness validator | `python tools/check_harness.py` | **HARNESS CHECK FAILED: FAIL pytest suite failed (all tests must be green)** exit 1. v1 was exit 0. |
-| Frontend tests | `cd frontend && npm test` | **RED** — vitest tries to import the Playwright spec in `tests/e2e/dashboard.spec.ts` and crashes: *"Playwright Test did not expect test.describe() to be called here."* One vitest unit test still passes. |
-| Frontend lint | `cd frontend && npm run lint` | GREEN, 1 warning (`react-hooks/exhaustive-deps` in `ActivityStream.tsx:16`). |
-
-### Why this matters
-
-`check_harness.py` was *upgraded* this round to enforce a `pytest`-green gate (`tools/check_harness.py:67-70`).
-That improvement is correct, but it means the OTel regression now cascades: because pytest errors,
-`check_harness.py` fails, which (per `AGENTS.md` Definition of Done) blocks every commit. The repo
-was `green / clean / exit 0` before this round; it is now **red across all three backend gates**.
-
-### Fix order (cheap, unblocks everything)
-1. `context_server/.venv/Scripts/python.exe -m pip install -r context_server/requirements.txt`
-   (installs the 4 OTel packages — **restricted action per `AGENTS.md`; needs your approval**).
-2. `ruff check context_server --fix` then `ruff check context_server` (resolves the 5 auto-fixable
-   violations; the other 7 (line-length, the unused `current_task`) need a quick manual edit).
-3. Delete the unused `current_task` in `governance/locks.py:27`.
-4. Add `exclude: ['tests/e2e/**']` to `frontend/vitest.config.ts` + add a `frontend/playwright.config.ts`.
-5. Re-run gates: `pytest -q` (expect 48 green), `ruff .`, `check_harness.py` (expect exit 0),
-   `npm test` (expect green).
-
-After these gates are green again, the genuine quality gains from this round can be trusted.
+### Other changes
+- ✅ **`requirements.txt`** — OTel pinned to `>=1.25.0` (was `==1.25.0`); added
+  `pytest-asyncio>=0.21.1`.
+- ✅ **`db.py`** — audit() OTel span emission unchanged from v2 (now actually works since deps
+  installed).
+- ✅ **`meter.py`** — `record()` signature unchanged; now *called* everywhere.
+- ✅ **`locks.py`** — unused `current_task` variable from v2 appears cleaned up in the cycle
+  walk (now uses `current_resource`).
+- ✅ **Registry** — `registry/agents/index.md` updated; all agents carry `bindings: []`.
 
 ---
 
-## 4. System Architecture (as designed)
+## 3. Gate Status (live results)
 
-(Unchanged from v1 — `agent_os_project_architecture.md` was not modified in this round.)
-Three layers: Orchestrator (opencode CLI, sole) → Context Server (FastAPI, :27180) → Mission
-Control (Next.js, :3000). Locked ports: Obsidian MCP 27124/27123, Context Server 27180,
-Mission Control 3000, Jaeger 4317/4318 (new this round via `docker-compose.yml`), Langfuse 3001
-(optional). Locked decisions D1–D8 unchanged. See `agent_os_project_architecture.md` §2 for the
-full diagram.
+| Gate | Command | v2 result | v3 result | Δ |
+|---|---|---|---|---|
+| Backend tests | `python -m pytest context_server/tests/ -q` | 6 ERRORS, 0 run | **48 passed** (2 warnings) | ✅ FIXED |
+| Backend lint | `ruff check context_server` | 12 violations | **23 violations** (16 W293, 3 I001, 2 W291, 1 E401, 1 E741) | 🔴 still RED (22 auto-fixable) |
+| Harness validator | `python tools/check_harness.py` | exit 1 (pytest fail) | **exit 0 — OK harness check passed** | ✅ FIXED |
+| Frontend tests | `cd frontend && npm test` | RED (vitest–Playwright collision) | **1 passed** (vitest green; e2e excluded) | ✅ FIXED |
+| Frontend lint | `cd frontend && npm run lint` | GREEN, 1 warning | **GREEN, 1 warning** (`ActivityStream.tsx:16` exhaustive-deps) | ✅ same |
+| Playwright | no config | not runnable | **`playwright.config.ts` added**; spec exists; not run in `npm test` | ⚠️ config'd, not verified green |
+| CI workflow | RED | `.github/workflows/ci.yml` runs pytest+ruff+check_harness+npm test+npm lint+typecheck+Playwright | ⚠️ will be RED until ruff fixed |
+
+### ruff violation breakdown (23 total)
+| Code | Count | Fixable | Location |
+|---|---|---|---|
+| W293 | 16 | ✅ `--fix` | blank-line-with-whitespace in hibernation.py, permissions.py, reconcile.py, main.py |
+| I001 | 3 | ✅ `--fix` | unsorted imports in main.py:340, reconcile.py:44 |
+| W291 | 2 | ✅ `--fix` | trailing whitespace |
+| E401 | 1 | ✅ `--fix` | `import os, re` on one line in reconcile.py:44 |
+| E741 | 1 | ❌ manual | ambiguous variable `l` in main.py:320 list comprehension |
+
+**Fix command:** `ruff check context_server --fix` (resolves 22), then rename `l` → `line_` at
+`main.py:320`.
+
+### Note on OTel trace export
+When Jaeger is not running (no `docker-compose up`), the OTel `BatchSpanProcessor` logs
+`Failed to export traces to localhost:4317` after tests complete. This does **not** fail pytest
+(exit 0) but adds ~5s of retry delay and noise. For CI, either start Jaeger or configure a
+no-op exporter in test mode. This is a **robustness nit**, not a gate failure.
+
+---
+
+## 4. System Architecture
+
+Three layers, unchanged in topology from v1/v2:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Orchestrator: opencode CLI (sole, forbid_native_cross_agent)│
+│  Reads PLAN.md top unchecked item → delegates via MCP        │
+└──────────────────┬──────────────────────────────────────────┘
+                   │ HMAC-signed X-Agent-Identity header
+                   ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Context Server (FastAPI, :27180)                            │
+│  ├── Identity (HMAC-SHA256)  ├── Policy MW (breaker/rate/DLP)│
+│  ├── Governance (locks+OCC, permissions, HITL, hibernation)  │
+│  ├── FinOps (meter, rollups, standup)  ├── Indexing (5 mods) │
+│  ├── Meta (dream_cycle, runner)  ├── Obsidian backend proxy  │
+│  ├── 2 SQLite stores (control_plane.db, token_usage.db)      │
+│  └── OTel TracerProvider → OTLP :4317 (Jaeger)               │
+└──────────────────┬──────────────────────────────────────────┘
+                   │ WebSocket + REST
+                   ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Mission Control (Next.js 14, :3000)                         │
+│  Pages: /, /kanban, /tokens, /hitl, /crash, /agents, /vault  │
+│  Zustand store + WS  │  Tailwind  │  Monaco  │  Playwright   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Locked ports:** Obsidian MCP 27124/27123, Context Server 27180, Mission Control 3000,
+Jaeger 4317/4318, Langfuse 3001 (optional).
+
+**Locked decisions D1–D8:** unchanged from architecture doc.
 
 ---
 
@@ -219,394 +205,428 @@ full diagram.
 ```
 context_server/
   app/
-    main.py              App entry + OTel TracerProvider/instrumentation (NEW) + /mcp/log_decision (NEW)
-    db.py                SQLite stores + audit() now emits OTel spans + Lamport counters (NEW)
-    identity.py          HMAC-SHA256 signed transport identity (unchanged, real)
+    main.py              App entry + OTel TracerProvider + all MCP endpoints + accept_implement file-write (NEW)
+    config.py            Settings (env-driven)
+    db.py                2 SQLite stores + audit() with OTel spans + Lamport counters
+    identity.py          HMAC-SHA256 signed transport identity
     obsidian_backend.py  httpx proxy to obsidian-local-rest-api
     registry.py          Loads registry/agents/*.md YAML
     adapters.py          Echo/Filesystem/Http adapters
     delegation.py        delegate_task: orchestrator-only, budget, ledger
-    middlewares.py       PolicyMiddleware (SQLite-durable breaker/rate-limit NEW) + DLPFilter (5 patterns NEW)
-    indexing/            store, graphify, headroom, compactor, drift, watcher
+    middlewares.py       PolicyMiddleware (SQLite-durable breaker/rate-limit) + DLPFilter (5 patterns) + Chaperon
+    indexing/
+      store.py           Graph node/edge store
+      graphify.py        File → graph walker
+      headroom.py        Budget arithmetic
+      compactor.py       LLM-augmented deterministic compaction (litellm)
+      drift.py           Temporal + semantic drift detection (NEW: Jaccard + banners)
+      watcher.py         watchfiles background indexer
     governance/
-      locks.py           Leased locks + DAG cycle detection (NEW) + OCC content-hash check
-      permissions.py     Allow-list matrix (default DENY)
+      locks.py           Leased locks + DAG cycle detection + OCC content-hash check
+      permissions.py     Allow-list matrix (default DENY) + lethal-trifecta P13 (NEW)
       hitl.py            Queue + 7-day expiry
-      hibernation.py     INSERT/DELETE JSON (UNCHANGED — full lifecycle still missing)
-      reconcile.py       Reaps TTL locks + auto-expires HITL (no crash-vs-TTL distinguish)
-    finops/              meter, rollups, standup (per-tool metering STILL not wired)
-    meta/                dream_cycle, runner
-    sandbox/             DELETED (deviation recorded)
-  tests/                 conftest + test_main/adapters/phase3/5/6/7/8/9 — collection ERRORs (regression)
-  requirements.txt       Now declares 4 opentelemetry-* packages (NEW) — NOT INSTALLED
+      hibernation.py     INSERT/DELETE + lock release/re-acquire + drift recheck (NEW: full P22)
+      reconcile.py       Crash reconcile: distinguish crash/TTL + PLAN finalize + HITL expire (NEW)
+    finops/
+      meter.py           record() + mark_accepted() — NOW CALLED at every MCP site (NEW)
+      rollups.py         CAPO, trend, heatmap, totals_by_task
+      standup.py         Daily standup generator
+    meta/
+      dream_cycle.py     Analyze proposals + render
+      runner.py          run_dream_cycle orchestrator
+  tests/                 conftest + test_main/adapters/phase3/5/6/7/8/9 — 48 passed
+  requirements.txt       fastapi, uvicorn, httpx, pydantic, mcp, pyyaml, watchfiles,
+                         tiktoken, litellm, opentelemetry-* (4), pytest-asyncio
 contracts/
-  obsidian_backend.md, orchestration.md, sandbox_driver.md  (original 3)
-  dlp.md, mcp_tools.md, observability.md, occ.md            (NEW — 3 lines each, thin)
+  obsidian_backend.md, orchestration.md, sandbox_driver.md   (original 3 — real)
+  dlp.md, mcp_tools.md, observability.md, occ.md             (new 4 — 2-3 line stubs)
 registry/
-  agents/*.md (6, opencode.md now has forbid_native_cross_agent NEW), adapters/
-  index.md (NEW), log.md (NEW), agents/index.md (NEW)
+  agents/*.md (6, all with bindings: [] NEW), adapters/
+  index.md, log.md, agents/index.md                          (OKF bundle structure)
 okf/
-  SPEC.md, log.md, concepts/{capo,delegate-task,dream-cycle}.md  (concepts now have frontmatter NEW)
-docker-compose.yml       Jaeger OTel collector (NEW)
-tools/check_harness.py   Discipline enforcer (NEW assertions + test-green gate)
+  SPEC.md, log.md, concepts/{capo,delegate-task,dream-cycle}.md  (frontmatter present)
+docker-compose.yml       Jaeger OTel collector
+tools/check_harness.py   Discipline enforcer (flag + frontmatter + append-only + test-green gate)
+scripts/
+  generate_agent_configs.py  NEW — dumps registry to YAML (Phase 5 generator)
+  smoke_test_phase1.py
 hooks/                   control_plane.db, token_usage.db (runtime, gitignored)
-frontend/                Next.js — Tailwind (NEW), Zustand store (NEW), left rail (NEW),
-                        auth middleware.ts+login/ (NEW), Monaco import (NEW), crash rerun (NEW),
-                        ActivityStream+CSV (NEW), Playwright pkg (NEW, broken config)
-project phases/          9 phase spec docs (unchanged)
-project_gaps.md          The remediation plan the user executed (NEW this round)
+frontend/                Next.js 14 — see §7 Phase 9 for detail
+  app/                   layout.tsx, nav.tsx (left rail), page.tsx (home + status pill)
+    components/          ActivityStream.tsx (WS consumer + CSV export)
+    task/[id]/           spans-only trajectory (no full lifecycle)
+    tokens/              table + heatmap (no SQL-view/CSV/time-range)
+    hitl/                Monaco readOnly editor (not a diff)
+    crash/               re-run button (keys off task_id)
+    kanban/, agents/, vault/, login/
+  lib/                   api.ts (/api rewrite now works), store.ts (Zustand + WS)
+  next.config.js         /api → :27180 rewrite (NEW)
+  vitest.config.ts       excludes tests/e2e/** (NEW)
+  playwright.config.ts   NEW — testDir: ./tests/e2e
+  tests/e2e/             dashboard.spec.ts
+Program.md               Metrics + Audit Schedule + Now + Dream proposals (NEW — filled)
+project phases/          9 phase spec docs
+project_gaps.md          The remediation plan
+project_documentation.md This file
 ```
 
 ---
 
-## 6. Phase-by-Phase Status (re-audited)
+## 6. Complete Feature Inventory — What the Code Actually Does
 
-Status legend: ✅ FULLY ⚠️ PARTIAL ❌ MISSING/BROKEN. "Δ" marks a change from v1.
+This section documents **every functional capability** the codebase currently ships, so the
+documentation covers the entire project.
+
+### 6.1 Context Server (FastAPI :27180)
+
+#### Health & Dashboard
+| Endpoint | Method | Function |
+|---|---|---|
+| `/health` | GET | Returns `ok` or `degraded` based on Obsidian backend reachability (never 5xx) |
+| `/dashboard/state` | GET | Locks + recent 25 audit rows + open HITL + recent 50 tasks + agent list |
+| `/dashboard/agents` | GET | All registered agents + orchestrator id |
+| `/dashboard/vault` | GET | Read-only Obsidian vault browse/read (list or read by path) |
+| `/dashboard/events` | WS | Broadcasts audit events to connected dashboard clients |
+| `/dashboard/plan` | GET | Parses PLAN.md kanban rows → structured JSON |
+| `/dashboard/graph` | GET | All graph nodes + edges |
+| `/dashboard/drift` | GET | Drift banners (impl-ahead + semantic_drift_detected) |
+| `/dashboard/headroom` | GET | Context budget remaining + must_compact flag |
+| `/dashboard/dream` | GET | Dream-Cycle proposals preview (dry run, no write) |
+
+#### MCP Tool Surface (identity-bound via `X-Agent-Identity` HMAC header)
+| Endpoint | Method | Function | Metered? |
+|---|---|---|---|
+| `/mcp/lookup_agent` | GET | Look up agent by id | — |
+| `/mcp/find_capability` | GET | Find agents by capability | — |
+| `/mcp/search_notes` | POST | Obsidian simple search + DLP scrub | ✅ |
+| `/mcp/read_note` | POST | Read note + compute version_hash + DLP scrub | ✅ |
+| `/mcp/append_implement` | POST | Governed write (permission → lock → OCC → DLP → idempotent patch) | ✅ |
+| `/mcp/log_decision` | POST | Same governed-write path as append_implement | ✅ |
+| `/mcp/delegate_task` | POST | Orchestrator-only delegation via adapters + token ledger | — (own path) |
+| `/mcp/accept_implement` | POST | Orchestrator-only: mark_accepted + **append row to IMPLEMENT.md file** | — |
+| `/mcp/request_clarification` | POST | Hibernate task + enqueue HITL + **route to orchestrator** | — |
+| `/mcp/post_standup` | POST | Generate daily standup | ✅ |
+| `/mcp/reindex` | POST | Run graphify indexer | ✅ |
+| `/mcp/compress` | POST | Run compactor within token budget | ✅ |
+| `/mcp/run_dream_cycle` | POST | Meta/orchestrator-only: run dream cycle | ✅ |
+
+#### HITL & Crash endpoints
+| Endpoint | Method | Function |
+|---|---|---|
+| `/dashboard/hitl` | GET | Open HITL items |
+| `/dashboard/hitl` | PATCH | Resolve HITL item (approved/modified/rejected) → thaw task |
+| `/dashboard/crashes` | GET | Run on-demand reconcile (reaped locks + hibernated orphans) |
+| `/dashboard/crashes/{task_id}/rerun` | POST | Thaw a hibernated task |
+
+#### FinOps endpoints
+| Endpoint | Method | Function |
+|---|---|---|
+| `/dashboard/tokens` | GET | by_task totals + heatmap |
+| `/dashboard/capo` | GET | CAPO summary + trend |
+| `/dashboard/tokens/ws` | WS | Pushes token totals + CAPO every 3s |
+
+#### Background loops (lifespan)
+- **Daily standup loop** — fires at 9am local, calls `post_standup()`, retries with backoff.
+- **Dream cycle loop** — fires at 3am local, calls `run_dream_cycle()`, retries with backoff.
+- **Crash reconciliation** — runs once on startup (`reconcile(startup=True)`).
+- **File watcher** — `watch_and_index()` via watchfiles (disabled in tests via `ENABLE_WATCHER=false`).
+
+### 6.2 Governance Subsystem
+
+| Module | Function |
+|---|---|
+| `identity.py` | HMAC-SHA256 signed `agent:task_id` tokens; `require_identity` dependency |
+| `locks.py` | SQLite-leased locks (120s TTL) + in-memory task-waiting DAG with O(V+E) cycle detection + OCC content-hash check (`check_occ`) |
+| `permissions.py` | Allow-list matrix: only `*/log.md` + `okf/log.md` paths, only `Agent Updates`/`Decisions`/`Implementation Log` headings. Default DENY. **P13 lethal-trifecta**: blocks tasks mixing `read_private` + `read_untrusted` |
+| `hitl.py` | SQLite queue with 7-day expiry; enqueue/open_items/resolve |
+| `hibernation.py` | **Full P22 lifecycle**: freeze releases locks → stores in frozen_state; thaw re-acquires locks + runs drift recheck → stores drift in frozen_state |
+| `reconcile.py` | **P26 crash reconciliation**: startup reaps all locks as `infrastructure_crash`; on-demand reaps expired as `ttl_expiry`; finalizes `[in-progress]`/`[delegated]` PLAN rows → `[crash]`; auto-expires HITL + thaws |
+
+### 6.3 Policy Middleware (per `/mcp/` request)
+1. **Circuit breaker** — SQLite-durable; 5 consecutive 5xx → 60s trip (503).
+2. **Rate limiter** — SQLite token bucket; 10 requests per 10s per agent (429).
+3. **OCC** — passes `X-Expected-Version` header through (actual check in endpoint).
+4. **Chaperon** — blocks untrusted-provenance writes to append_implement/log_decision (403).
+
+### 6.4 DLP Filter (5 patterns)
+AWS keys (`AKIA…`), Bearer tokens, GitHub PATs (`ghp_…`), Slack tokens (`xox…`), private-key
+blocks, generic ≥40-char high-entropy strings. Applied to all read/write content.
+
+### 6.5 Indexing Subsystem
+| Module | Function |
+|---|---|
+| `store.py` | In-memory graph store (nodes + edges) with SQLite persistence |
+| `graphify.py` | Walks repo files → builds graph nodes/edges |
+| `headroom.py` | Context budget: `remaining(used)`, `must_compact(used, incoming)` |
+| `compactor.py` | Deterministic + LLM-augmented (litellm) compaction within token budget; uses tiktoken |
+| `drift.py` | **Temporal divergence** (≥3 newer code files vs contract) + **semantic drift** (Jaccard token overlap < 0.1) → banners with `trigger_dream_renorm` action |
+| `watcher.py` | Background `watchfiles` indexer that calls `graphify()` on file changes |
+
+### 6.6 FinOps Subsystem
+| Module | Function |
+|---|---|
+| `meter.py` | `record()` — inserts token_ledger row per tool call (NOW CALLED at every MCP site); `mark_accepted()` — flips accepted=1 for a task |
+| `rollups.py` | `capo()` (tokens/accepted-task), `capo_trend()`, `heatmap()` (agent×tool), `totals_by_task()` |
+| `standup.py` | Daily standup generator |
+
+### 6.7 Meta Subsystem
+| Module | Function |
+|---|---|
+| `dream_cycle.py` | `analyze()` — generates optimization proposals; `render()` — formats for Program.md |
+| `runner.py` | `run_dream_cycle()` — orchestrates analyze + write to Program.md proposals section |
+
+### 6.8 SQLite Stores
+**control_plane.db**: `locks`, `hibernation`, `audit_log`, `breaker_state`, `rate_limits`,
+`hitl_queue` — all WAL mode.
+**token_usage.db**: `token_ledger` (agent, task_id, tool, tokens_in, tokens_out, accepted).
+
+### 6.9 Observability
+- **OpenTelemetry SDK** wired: `TracerProvider` + `BatchSpanProcessor` + `OTLPSpanExporter`
+  → `localhost:4317` (Jaeger). `FastAPIInstrumentor` instruments the app.
+- **`audit()`** emits real spans with attributes: `agent`, `task_id`, `ok`, `detail`,
+  `lamport_seq` (monotonic counter), `failure_class` (`auth` if DENY in detail, else `system`).
+- **Jaeger** via `docker-compose.yml` (all-in-one collector on :4317/:4318).
+
+### 6.10 Registry & OKF
+- **6 agents**: opencode (orchestrator), hermes, claude-code, codex, antigravity, meta —
+  all with `bindings: []`, capabilities, role, adapter fields.
+- **OKF bundle**: `okf/SPEC.md`, `okf/log.md`, `okf/concepts/{capo,delegate-task,dream-cycle}.md`
+  (all with `id, title, tags, source` frontmatter).
+- **Registry bundle**: `registry/index.md`, `registry/log.md`, `registry/agents/index.md`.
+
+### 6.11 Frontend (Next.js 14 :3000)
+| Page | Status | What it does |
+|---|---|---|
+| `/` (home) | ✅ Real | Health status pill + active locks + ActivityStream (WS consumer + CSV export) |
+| `/kanban` | ✅ Real | Fetches `/dashboard/plan`, renders PLAN.md rows |
+| `/tokens` | ⚠️ Partial | by_task table + heatmap; no SQL-view layout, no time-range, no CSV on page |
+| `/hitl` | ⚠️ Partial | Monaco editor (readOnly, not a diff); Approve/Modify/Reject buttons |
+| `/crash` | ⚠️ Partial | Released locks + hibernated orphans + re-run button (keys off task_id) |
+| `/agents` | ✅ Real | Fetches `/dashboard/agents` |
+| `/vault` | ✅ Real | Fetches `/dashboard/vault`, browse/read notes |
+| `/task/[id]` | ⚠️ Partial | Filters audit_log spans by task_id (no full lifecycle) |
+| `/login` | ⚠️ Partial | Hardcoded `admin-token-123` cookie check |
+
+**Frontend infrastructure**: Tailwind ✅, Zustand store + WS ✅, left-rail nav + framer-motion ✅,
+Monaco imported ✅, Playwright package + config ✅, `/api` rewrite ✅, auth middleware ✅ (skeleton).
+**Dead/missing deps**: `@tanstack/react-query` installed but no `QueryClientProvider`;
+`@shadcn/ui` not installed.
+
+---
+
+## 7. Phase-by-Phase Status (re-audited v3)
+
+Status legend: ✅ FULLY ⚠️ PARTIAL ❌ MISSING/BROKEN. "Δ" marks a change from v2.
 
 ### Phase 0 — Foundations & Contracts — ✅ (was ✅)
-- ✅ 3 original contracts present
-- ✅ `check_harness.py` now a real enforcer (NEW)
-- ⚠️ Contract set still incomplete — only 7 contracts exist (`obsidian_backend`, `orchestration`,
-  `sandbox_driver` + new `dlp`, `mcp_tools`, `observability`, `occ`). The 4 new ones are 3-line
-  stubs. Still missing: `identity`, `secrets_bridge`, `read_chaperon`, `circuit_breaker`,
-  `rate_limit`, `project_contract`, `obsidian_export_hook`, `delta_indexing`, `permission_matrix`,
-  `hibernation`, `crash_recovery`, `lock_manager`.
+- ✅ 3 original contracts + 4 new (stub) contracts
+- ✅ `check_harness.py` discipline enforcer (flag, frontmatter, append-only, test-green gate)
+- ⚠️ 12 contracts still missing; 4 new contracts are 2-3 line stubs
 
-### Phase 1 — Wire the Two Brains — ✅ (was ⚠️ → upgraded)
-- ✅ Obsidian backend proxy (`obsidian_backend.py`), adapter contract present
-- ✅ opencode registered as sole orchestrator
-- ✅ **OKF concepts now carry frontmatter** (Δ) — `okf/concepts/capo.md:1-6` verified
-- ✅ **Registry is now an OKF bundle** (Δ) — `index.md`, `log.md`, `agents/index.md` added
-- ⚠️ `bindings` field still missing on every agent markdown (unchanged gap)
+### Phase 1 — Wire the Two Brains — ✅ (was ✅)
+- ✅ Obsidian backend proxy, opencode sole orchestrator, OKF frontmatter, OKF bundle structure
+- ✅ **`bindings` field now on all 6 agents** (Δ)
 
-### Phase 2 — Context Server — ⚠️ (was ⚠️ → improved but RED)
-- ✅ FastAPI, `/health` (degraded, not 5xx)
-- ✅ HMAC-SHA256 identity (`identity.py:11-34`) — unchanged, real
-- ✅ **DLP widened** (Δ) — 5 patterns
-- ✅ **OCC content-hash** (Δ) — `main.py:229,247,270`
-- ✅ **Breaker + rate-limit now SQLite-durable** (Δ)
-- ✅ **Lock DAG cycle detection** (Δ) — `governance/locks.py:24-44`
-- ⚠️ **OTel/Lamport/failure-class now in code** (Δ) — but **broken by uninstalled deps**
-- ⚠️ Chaperon still only blocks untrusted writes → 403 (no macro-span/sampled-args, P31 partial)
-- ❌ **`/mcp/log_decision` endpoint FIXED** (Δ) — `main.py:260-281`
-- ⚠️ Secrets bridge — still just env passthrough (no ephemeral injection, P11 partial)
-- ⚠️ Lamport counters exist in code (`db.py:9-16`) but untested (tests can't import)
+### Phase 2 — Context Server — ✅ (was ⚠️ → upgraded to GREEN)
+- ✅ FastAPI, `/health`, HMAC identity, DLP (5 patterns), OCC content-hash, SQLite-durable breaker/rate-limit, lock DAG cycle detection
+- ✅ **OTel/Lamport/failure-class now WORKING** (Δ — deps installed, tests green, app boots)
+- ✅ **Chaperon** blocks untrusted writes (403)
+- ⚠️ Secrets bridge still env passthrough (no ephemeral injection, P11)
 
-### Phase 3 — Agent Registry, Adapters & delegate_task — ✅ (was ⚠️ → upgraded)
-- ✅ 6 agents + registry loader; `find_capability`, `accept_implement` orchestrator-only
-- ✅ Real `Filesystem`/`Http` adapters
-- ✅ **`forbid_native_cross_agent: true` flag fixed** (Δ) — `registry/agents/opencode.md:6`,
-  asserted by `check_harness.py:31-32`
-- ⚠️ `bindings` field still missing (unchanged)
+### Phase 3 — Agent Registry, Adapters & delegate_task — ✅ (was ✅)
+- ✅ 6 agents + registry loader; `forbid_native_cross_agent: true` asserted; `bindings` on all
+- ✅ Real Filesystem/Http adapters; orchestrator-only delegation
 
-### Phase 4 — Per-Project Harness Contract — ✅ (was ⚠️ → upgraded)
-- ✅ Harness triad present; validator now enforces
-- ✅ `/dashboard/vault`, `/dashboard/plan` parse
-- ✅ **`check_harness.py` upgraded** (Δ) — flag, frontmatter, append-only, test-green
-- ⚠️ `project_contract.md`, `obsidian_export_hook.md` still missing (unchanged)
+### Phase 4 — Per-Project Harness Contract — ✅ (was ✅)
+- ✅ Harness triad; `check_harness.py` enforcer; `/dashboard/vault`, `/dashboard/plan` parse
+- ⚠️ `project_contract.md`, `obsidian_export_hook.md` still missing
 
-### Phase 5 — Indexing & Generation — ⚠️ (unchanged structurally; now RED)
-- ✅ Indexing module real (delta-aware, tiktoken, LLM-augmented compactor, watcher)
-- ⚠️ Drift still a timestamp heuristic (not code-graph divergence, no vector/P30)
-- ❌ `scripts/generate_agent_configs.py` still missing
-- ❌ `contracts/delta_indexing.md` still missing
-- ❌ Tests for this phase do not run (regression) — collection ERROR
+### Phase 5 — Indexing & Generation — ✅ (was ⚠️ → upgraded)
+- ✅ Indexing module real (delta-aware, tiktoken, litellm compactor, watcher)
+- ✅ **`scripts/generate_agent_configs.py` added** (Δ)
+- ⚠️ Drift now has temporal + semantic (Jaccard) detection (Δ) — but not real vector embeddings
+- ⚠️ `contracts/delta_indexing.md` still missing
 
-### Phase 6 — Verification, Permissions, HITL, Hibernation, Crash Reconciliation — ⚠️ (was ❌ → improved)
-- ✅ Permission matrix default-DENY; governed write path real; HITL queue + expiry
-- ✅ **Lock DAG cycle detection added** (Δ) — addresses P28
-- ✅ **Crash re-run endpoint added** (Δ) — `/dashboard/crashes/{task_id}/rerun` (`main.py:323-326`)
-  calls `thaw()`. Frontend has a re-run button.
-- ⚠️ `reconcile.py:10-35` still reaps locks whose `lease_expires_at <= now` — does NOT distinguish
-  crash from normal TTL expiry, does NOT sweep sandboxes (sandbox removed), does NOT close spans as
-  `infrastructure_crash`, does NOT finalize `in_progress` PLAN rows, does NOT roll back. (P26 still partial.)
-- ⚠️ `hibernation.py` still just INSERT/DELETE a JSON blob — no token revoke, no sandbox terminate,
-  no lock release/re-acquire, no stale-on-thaw drift re-check. (P22 still partial.)
-- ⚠️ HITL still only enqueued for the UI — not routed to the orchestrator (unchanged)
-- ❌ `accept_implement` still does NOT append the accepted row to `IMPLEMENT.md` file (unchanged) —
-  `main.py:289-295` only flips the ledger flag
-- ❌ Lethal-trifecta / instruction-provenance combinatorial rule (P13) — not implemented
+### Phase 6 — Verification, Permissions, HITL, Hibernation, Crash Reconciliation — ✅ (was ⚠️ → upgraded)
+- ✅ Permission matrix default-DENY + **P13 lethal-trifecta** (Δ)
+- ✅ Lock DAG cycle detection; HITL queue + 7-day expiry + **routed to orchestrator** (Δ)
+- ✅ **Full P22 hibernation lifecycle** — lock release/re-acquire + drift recheck (Δ)
+- ✅ **P26 crash reconciliation** — crash-vs-TTL distinguish + PLAN finalize + HITL auto-expire (Δ)
+- ✅ `accept_implement` now **writes the IMPLEMENT.md file row** (Δ)
+- ✅ Crash re-run endpoint + frontend re-run button
+- ⚠️ Still missing: close OTel spans as `infrastructure_crash`, rollback to snapshot
 - ❌ `contracts/{permission_matrix,hibernation,crash_recovery}.md` still missing
 
-### Phase 7 — Daily Ops & Cost Discipline (CAPO) — ⚠️ (unchanged core gap)
-- ✅ `finops/meter.py`, `rollups.py`, `standup.py`; `/dashboard/tokens`, `/dashboard/capo`, websockets
-- ❌ **Per-tool token metering STILL not wired** (unchanged from v1) — `finops/meter.record()` is
-  defined (`meter.py:7-14`) and `mark_accepted` exists, but **`meter.record` is never called at any
-  MCP call site** (`search_notes`, `read_note`, `append_implement`, `log_decision`, `reindex`,
-  `compress`, `post_standup`, `run_dream_cycle`). Only `delegate_task` writes `token_ledger`. → CAPO
-  still measures "tokens-per-accepted-delegation," not "every tool call."
-- ❌ `hooks/task_outcomes.db` (arch Phase 7 separate denominator) still absent — fold-in still
-  undocumented as a deviation in `IMPLEMENT.md` (the deviations table mentions other items but NOT
-  this one)
-- ❌ Week rollup to `registry/log.md` — `registry/log.md` now exists (3 lines) but is empty of rollups
+### Phase 7 — Daily Ops & Cost Discipline (CAPO) — ✅ (was ⚠️ → upgraded)
+- ✅ **Per-tool token metering NOW WIRED** — `meter.record()` called at every MCP call site (Δ)
+- ✅ CAPO, trend, heatmap, totals, standup, websockets
+- ⚠️ `hooks/task_outcomes.db` still absent (fold-in not documented as deviation)
+- ⚠️ Week rollup to `registry/log.md` — file exists but empty of rollups
 
-### Phase 8 — Meta-Harness & Dream Cycle — ✅ for phase-doc DoD (unchanged)
-- ✅ `meta/dream_cycle.py` analyze + render; `/dashboard/dream`, `/mcp/run_dream_cycle` (403 for non-meta)
-- ✅ `registry/agents/meta.md` registered
-- ⚠️ `Program.md` still empty stub (P7 audit-schedule gap)
+### Phase 8 — Meta-Harness & Dream Cycle — ✅ (was ✅)
+- ✅ `meta/dream_cycle.py` analyze + render; endpoints; meta agent registered
+- ✅ **`Program.md` now filled** with metrics + audit schedule + proposals (Δ)
 - ⚠️ No recorded accepted Dream-Cycle proposal (unchanged)
 
-### Phase 9 — Next.js Mission Control — NOT READY, ~45% (was ~25%)
+### Phase 9 — Next.js Mission Control — NOT READY, ~50% (was ~45%)
 
-Phase 9 DoD checklist (re-audited):
-
-| # | DoD item | v1 | v2 | Evidence (file:line) |
+| # | DoD item | v2 | v3 | Evidence |
 |---|---|---|---|---|
-| 1 | Every page renders real data | FULLY | FULLY | all pages real `fetch` to `127.0.0.1:27180` |
-| 2 | Full task lifecycle in `/task/[id]` | MISSING | **MISSING** | `task/[id]/page.tsx:4-15` still only filters `recent_activity` into spans — no PLAN/breaker/HITL/freeze/thaw/gate/CAPO |
-| 3 | `/tokens` SQL views + time-range + CSV | MISSING | **MISSING** | `tokens/page.tsx:4-29` — no selector, no time-range, no CSV (CSV lives on `ActivityStream.tsx:20-39`, home page) |
-| 4 | `/hitl` monaco DIFF modal approve/modify/reject | MISSING | **PARTIAL** | `hitl/page.tsx:3,38` imports `@monaco-editor/react` but renders a **readOnly single editor**, not a diff; `Modify` sends `status:"modified"` with no edit affordance (`:13-19`) |
-| 5 | `/crash` one-click re-run from snapshot id | MISSING | **PARTIAL** | `crash/page.tsx:18-21,39` re-run button → `/dashboard/crashes/{taskId}/rerun`; keys off `task_id`, not a snapshot id |
-| 6 | Playwright green; Lighthouse a11y ≥ 95 | MISSING | **MISSING** | `@playwright/test` installed + `tests/e2e/dashboard.spec.ts` written, but **no `playwright.config.ts`**; vitest mis-runs the spec → `npm test` RED. No Lighthouse config. |
-| 7 | WebSocket `/dashboard/events` + 5s poll fallback | MISSING | **PARTIAL** | `lib/store.ts:22-46` opens WS to `/dashboard/events` + `/dashboard/tokens/ws`; ActivityStream consumes. **No 5s poll fallback anywhere;** no reconnect logic |
-| 8 | Auth: local PIN + signed (ui, human) tokens | MISSING | **PARTIAL** | `middleware.ts:4-25` + `/login` — but literal-string compare `=== "admin-token-123"`; **no PIN, no HMAC signing, no ui/human split** |
-| 9 | Left rail nav + top-bar global pill | MISSING | **PARTIAL** | `nav.tsx:22-49` left rail ✓; **no top bar**, status pill only on `/` (`page.tsx:37-52`) |
-| 10 | Deps installed & USED | — | **PARTIAL** | Tailwind ✓, Zustand ✓, Monaco ✓ (installed), Playwright ✓ (installed, uninconfig'd), framer-motion ✓, lucide-react ✓. **`@tanstack/react-query` installed but NO `QueryClientProvider` anywhere → dead.** **`@shadcn/ui` NOT installed at all** (not in package.json, not in node_modules). `clsx`/`tailwind-merge` installed but unused. |
-
-Frontend gates: `npm run lint` GREEN (1 warning); `npm test` **RED** (vitest–Playwright collision,
-see §3 fix #4); no Lighthouse.
+| 1 | Every page renders real data | FULLY | FULLY | all pages fetch from :27180 or /api |
+| 2 | Full task lifecycle in `/task/[id]` | MISSING | **MISSING** | `task/[id]/page.tsx` still spans-only |
+| 3 | `/tokens` SQL views + time-range + CSV | MISSING | **MISSING** | table + heatmap only |
+| 4 | `/hitl` Monaco DIFF modal | PARTIAL | **PARTIAL** | readOnly single editor, not a diff; Modify has no edit affordance |
+| 5 | `/crash` re-run from snapshot id | PARTIAL | **PARTIAL** | keys off task_id, not snapshot id |
+| 6 | Playwright green; Lighthouse a11y ≥ 95 | MISSING | **PARTIAL** | config added (Δ); no Lighthouse |
+| 7 | WS + 5s poll fallback | PARTIAL | **PARTIAL** | WS works; no poll fallback, no reconnect |
+| 8 | Auth: PIN + signed tokens | PARTIAL | **PARTIAL** | hardcoded `admin-token-123` literal |
+| 9 | Left rail + top-bar pill | PARTIAL | **PARTIAL** | left rail ✓; no top bar; pill only on `/` |
+| 10 | Deps installed & USED | PARTIAL | **PARTIAL** | `/api` rewrite fixed (Δ); TanStack unused; shadcn not installed |
 
 ---
 
-## 7. Gap Closure Scorecard — v1 → now
+## 8. Gap Closure Scorecard — v2 → v3
 
-From `project_gaps.md` priority tiers, now with re-audit verdicts.
-
-### P0 — Spec-truth blockers
-| Gap | v1 | Now | Status |
+### Tier 0 — Gate unblockers
+| Gap | v2 | v3 | Status |
 |---|---|---|---|
-| Ship `/mcp/log_decision` | MISSING | FULLY | ✅ CLOSED (`main.py:260-281`) |
-| `forbid_native_cross_agent` flag | wrong key | correct + asserted | ✅ CLOSED (`opencode.md:6`, `check_harness.py:31`) |
-| OKF concept frontmatter | MISSING | present | ✅ CLOSED (`okf/concepts/*.md:1-6`) |
-| Correct the ledger (P5-1 "24/24" + deviations table) | OPTIMISTIC | honest | ✅ CLOSED (`IMPLEMENT.md:16,165-169`) |
+| OTel deps not installed → pytest/ruff/check_harness RED | RED | **GREEN** | ✅ CLOSED |
+| `vitest.config.ts` missing e2e exclude + no playwright config | RED | **GREEN** | ✅ CLOSED |
+| `next.config.js` missing `/api` rewrite | OPEN | **CLOSED** | ✅ CLOSED |
+| ruff violations | 12 | 23 | ❌ STILL RED (22 auto-fixable) |
 
-### P1 — Robustness hardening
-| Gap | v1 | Now | Status |
+### Tier 1 — Backend behavioral gaps
+| Gap | v2 | v3 | Status |
 |---|---|---|---|
-| Durable breaker + rate-limit | in-memory | SQLite-backed | ✅ CLOSED (`db.py:58-68`, `middlewares.py:29-84`) |
-| OCC on content hash | mtime | SHA-256 | ✅ CLOSED (`main.py:229,247,270`) |
-| Widen DLP | 2 patterns | 5 patterns | ✅ CLOSED (`middlewares.py:96-99`) |
-| Wire/delete sandbox | dead code | deleted + deviation recorded | ✅ CLOSED (deviation accepted) |
-| Lock DAG + cycle detection (P28) | single-row lease | cycle walk added | ✅ CLOSED (`locks.py:24-44`) |
-| Secrets rotation + ephemeral injection (P11) | partial | unchanged | ❌ STILL OPEN |
+| Per-tool token metering wired (Phase 7 DoD) | OPEN | **CLOSED** | ✅ `meter_record()` at all 8 MCP sites |
+| `accept_implement` writes IMPLEMENT.md file row | OPEN | **CLOSED** | ✅ `main.py:297-327` |
+| HITL routed to orchestrator | OPEN | **CLOSED** | ✅ `main.py:339-350` |
+| Full hibernation lifecycle P22 | OPEN | **CLOSED** | ✅ `hibernation.py:13-48` |
+| Real crash reconciliation P26 | PARTIAL | **SUBSTANTIALLY CLOSED** | ⚠️ crash/TTL distinguish + PLAN finalize done; span-close + rollback remain |
+| Lethal-trifecta / instruction-provenance P13 | OPEN | **CLOSED** | ✅ `permissions.py:30-36` |
+| Real drift detection P30 | OPEN | **PARTIAL** | ⚠️ temporal + Jaccard semantic; no real vector store |
+| `scripts/generate_agent_configs.py` | OPEN | **CLOSED** | ✅ new file |
+| `Program.md` audit schedule P7 | OPEN | **CLOSED** | ✅ metrics + schedule + proposals |
+| `bindings` field on all agents | OPEN | **CLOSED** | ✅ all 6 agents |
+| Secrets rotation + ephemeral injection P11 | OPEN | **OPEN** | ❌ unchanged |
 
-### P2 — Real observability
-| Gap | v1 | Now | Status |
+### Tier 2 — Frontend (Phase 9)
+| Gap | v2 | v3 | Status |
 |---|---|---|---|
-| OTel collector + real spans + Lamport + failure-class tags | FAKED (audit_log rows) | **WIRED IN CODE** but **deps not installed → tests/validator RED** | ⚠️ ATTEMPTED — unblocks as §3 fix #1/#2 |
-
-### P3 — Frontend (was 25%)
-| Gap | v1 | Now | Status |
-|---|---|---|---|
-| WebSocket consumer for `/dashboard/events` | MISSING | Zustand store + ActivityStream | ✅ CLOSED (`lib/store.ts`, `ActivityStream.tsx`) |
-| Monaco diff modal | `<pre>` JSON | Monaco imported, but **readOnly single editor not a diff** | ⚠️ PARTIAL |
-| CSV export | MISSING | on ActivityStream (home), **not on `/tokens`** | ⚠️ PARTIAL |
-| Crash re-run button | MISSING | present (keys off task_id, not snapshot id) | ⚠️ PARTIAL |
-| Playwright | NONE | pkg + 1 spec, **no config → `npm test` RED** | ⚠️ PARTIAL/BROKEN |
-| Auth (PIN + signed ui+human tokens) | NONE | hardcoded literal-token cookie gate | ⚠️ PARTIAL |
-| Left rail + top-bar pill | horizontal nav | left rail ✓; no top bar pill | ⚠️ PARTIAL |
-| Tailwind/Zustand/shadcn/TanStack(used)/Monaco/Playwright | missing | Tailwind✓ Zustand✓ Monaco✓ Playwright✓ (unconfigured) **shadcn✗ TanStack unused✗** | ⚠️ PARTIAL |
-| Full task lifecycle in `/task/[id]` | MISSING | **still spans only** | ❌ STILL OPEN |
-| `/tokens` time-range + SQL-view + CSV | MISSING | **unchanged** | ❌ STILL OPEN |
-| 5s poll fallback on WS | NONE | **none** | ❌ STILL OPEN |
-
-### "Highly-robust" additions
-| Gap | v1 | Now | Status |
-|---|---|---|---|
-| Contract completeness (~80% missing) | 3 contracts | 7 contracts (4 new, 3-line stubs) | ⚠️ PARTIAL (12 still missing) |
-| `check_harness.py` discipline enforcer | presence check | flag+frontmatter+append-only+test-green | ✅ CLOSED |
-| Registry as OKF bundle | MISSING | `index.md`/`log.md`/`agents/index.md` added | ✅ CLOSED |
-| CI | NONE | `.github/workflows/ci.yml` modified | ⚠️ EXISTS (content not deeply audited; will be RED until §3 fixed) |
-| Secrets rotation + ephemeral injection | partial | unchanged | ❌ STILL OPEN |
-
-### Gaps NOT from the plan that remain from v1
-| Gap | Status |
-|---|---|
-| Per-tool token metering wired into every MCP call site (Phase 7 DoD) | ❌ UNCHANGED — `meter.record` never called; CAPO is delegation-only |
-| `accept_implement` appends the row to `IMPLEMENT.md` file | ❌ UNCHANGED — only flips ledger flag |
-| HITL routed to the orchestrator (not just the UI queue) | ❌ UNCHANGED |
-| Full hibernation lifecycle P22 (token revoke / sandbox terminate / lock release-reacquire / drift recheck) | ❌ UNCHANGED — still INSERT/DELETE JSON |
-| Real crash reconciliation P26 (crash-vs-TTL distinguish / span `infrastructure_crash` / task finalize / rollback) | ⚠️ PARTIAL — added HITL auto-expire + thaw + re-run endpoint, but not the distinguishing/finalize/rollback |
-| Lethal-trifecta / instruction-provenance (P13) | ❌ UNCHANGED |
-| Real drift (code-graph divergence + vector + `semantic_drift_detected` + Dream re-norm, P30) | ❌ UNCHANGED |
-| `scripts/generate_agent_configs.py` | ❌ UNCHANGED |
-| `Program.md` audit schedule (P7) | ❌ UNCHANGED (empty stub) |
-| `bindings` field on every agent | ❌ UNCHANGED |
-
----
-
-## 8. Remaining Gaps
-
-Consolidated, de-duplicated list of gaps still open after this round.
-
-### Blocker tier (must fix before any commit)
-1. **OTel deps not installed** → `pytest` 6 collection errors, `ruff` 12 violations,
-   `check_harness.py` FAIL. (§3 fix #1, #2, #3)
-2. **`frontend/vitest.config.ts` missing `exclude: ['tests/e2e/**']`** + no
-   `frontend/playwright.config.ts` → `npm test` RED. (§3 fix #4)
-
-### Backend behavioral (still open from v1)
-3. **Per-tool token metering not wired** — `finops/meter.record` not called at MCP call sites;
-   CAPO is delegation-only.
-4. **`accept_implement` doesn't write the IMPLEMENT.md file row** — only flips ledger flag.
-5. **HITL not routed to orchestrator** — only the UI queue.
-6. **Full hibernation lifecycle (P22)** — token revoke / sandbox terminate / lock release-reacquire
-   / drift recheck on thaw. Currently INSERT/DELETE JSON.
-7. **Real crash reconciliation (P26)** — distinguish crash from TTL expiry, close spans as
-   `infrastructure_crash`, finalize `in_progress` PLAN rows, roll back. Re-run endpoint added; the
-   rest is open.
-8. **Lethal-trifecta / instruction-provenance permission rule (P13).**
-9. **Real drift detection (P30)** — code-graph divergence + vector store +
-   `semantic_drift_detected` + Dream-Cycle re-normalization.
-10. **Secrets rotation + ephemeral sandbox-credential injection (P11)** — sandbox removed, but the
-    rotation alerts / ephemeral injection still don't exist.
-11. **`scripts/generate_agent_configs.py`** still missing (Phase 5 generator).
-12. **`Program.md`** still empty stub; quarter audit not scheduled (P7).
-13. **`bindings` field** still missing on every agent markdown (parent Phase 3 DoD).
-
-### Frontend (Phase 9) — still missing
-14. **`/task/[id]` full task lifecycle view** — PLAN row → spans → breaker → HITL → freeze → thaw →
-    gate → CAPO (still spans only).
-15. **`/tokens`** — SQL views layout, time-range selector, **CSV export on this page**.
-16. **`/hitl` real Monaco *diff* (original ↔ modified)** with editable right pane; Modify must let
-    the user edit content and re-run OCC.
-17. **`/crash` re-run keyed on snapshot id**, not just task_id.
-18. **`npm test` Playwright suite green** — add `playwright.config.ts`, fix vitest exclusion.
-19. **Lighthouse a11y ≥ 95** — no config.
-20. **5s poll fallback** on the WebSocket store (with reconnect).
-21. **Real auth** — local PIN + HMAC-signed `(ui, human)` tokens, not a hardcoded literal cookie.
-22. **Top-bar global status pill** (currently only on `/`).
-23. **`@shadcn/ui` not installed** — install or drop from the spec; **`@tanstack/react-query`
-    installed but never instantiated** — add `QueryClientProvider` in `layout.tsx` or remove it.
-24. **`next.config.js` has no `/api` rewrite** but `lib/api.ts:1` (client branch) calls `/api/...`
-    — client-side `api()` calls will 404 (verify and fix the rewrite or the base URL).
-25. **Pages still use silent `.catch(() => fakeDefault)`** fallbacks that mask real backend failures
-    (unchanged from v1).
-
-### Contracts / governance
-26. **12 contracts still missing** — `identity`, `secrets_bridge`, `read_chaperon`, `circuit_breaker`,
-    `rate_limit`, `project_contract`, `obsidian_export_hook`, `delta_indexing`, `permission_matrix`,
-    `hibernation`, `crash_recovery`, `lock_manager`. The 4 new contracts are 3-line stubs — should be
-    fleshed out to be enforceable.
-27. **`IMPLEMENT.md` "Deviations summary" still missing the `task_outcomes.db` fold-in** deviation
-    (CAPO denominator lives in `token_ledger.accepted`, not a separate file per arch Phase 7 DoD).
-
----
-
-## 9. Test, Lint & Harness Validator Status
-
-| Gate | Command | v1 result | v2 result | Δ |
-|---|---|---|---|---|
-| Backend tests | `python -m pytest context_server/tests/ -q` | 48 passed | **6 collection ERRORS, 0 tests run** | 🔴 regression |
-| Backend lint | `ruff check context_server` | clean | **12 violations** (`I001` db.py imports, `F841` `current_task` @ `locks.py:27`, multiple `W293`, `E501` in SQL strings) | 🔴 regression |
-| Harness validator | `python tools/check_harness.py` | exit 0 | **exit 1 — FAIL pytest suite failed** | 🔴 regression |
-| Frontend tests | `cd frontend && npm test` | 1 passed | **RED** (vitest runs Playwright spec, crashes) — 1 unit test still passes | 🔴 regression |
-| Frontend lint | `cd frontend && npm run lint` | clean | GREEN, 1 warning (`ActivityStream.tsx:16` exhaustive-deps) | ✅ |
-| Playwright | none | n/a | `@playwright/test` installed, 1 spec, **no config** — not runnable | ⚠️ partial |
-
-**Note on the v1 test count:** `IMPLEMENT.md:16` was corrected this round to "19/24 tests green"
-(reflecting the actual 19 functions in `test_phase5.py`), but the *total* backend suite was 48
-passing before this round — that number is the relevant baseline for the regression.
-
----
-
-## 10. What Else Needs to Be Added (re-prioritized)
-
-### Tier 0 — Unblock the gates (do first, ~10 minutes)
-1. `pip install -r context_server/requirements.txt` in the venv (installs the 4 OTel packages)
-   — **restricted per `AGENTS.md`; needs your approval**.
-2. `ruff check context_server --fix` + delete `current_task` in `governance/locks.py:27` + reflow
-   the SQL strings in `middlewares.py` that exceed line length.
-3. Add `exclude: ['tests/e2e/**']` to `frontend/vitest.config.ts`; add
-   `frontend/playwright.config.ts` (e.g. `testDir: './tests/e2e'`).
-4. Re-run: `pytest -q` (expect 48 green), `ruff .`, `check_harness.py` (expect exit 0),
-   `npm test` (expect green). **Do not commit until all four are green** — `AGENTS.md` Definition of
-   Done forbids it.
-
-### Tier 1 — Close the remaining v1 backend gaps
-5. Wire `finops/meter.record()` into every MCP tool call site (search_notes, read_note,
-   append_implement, log_decision, reindex, compress, post_standup, run_dream_cycle).
-6. Make `accept_implement` append the accepted row to `IMPLEMENT.md` (Phase 6.3).
-7. Route HITL `request_clarification` to the orchestrator in addition to the UI queue.
-8. Implement the full hibernation lifecycle (P22): token revoke + sandbox terminate + lock release
-   on freeze; lock re-acquire + stale-on-thaw drift recheck on thaw.
-9. Real crash reconciliation (P26): distinguish crash from TTL, close spans as
-   `infrastructure_crash`, finalize `in_progress` PLAN rows, roll back to snapshot, wire the re-run
-   endpoint to use the snapshot id.
-10. Lethal-trifecta / instruction-provenance permission rule (P13).
-11. Real drift detection + vector store + `semantic_drift_detected` + Dream re-norm (P30).
-12. `scripts/generate_agent_configs.py` generator (Phase 5).
-13. Fill `Program.md` with the optimization metric + quarterly audit schedule (P7); record one
-    accepted Dream-Cycle proposal.
-14. Add `bindings` to every agent markdown.
-15. Document the `task_outcomes.db` fold-in as a deviation in `IMPLEMENT.md`, or create the separate
-    `hooks/task_outcomes.db` per arch Phase 7.
-
-### Tier 2 — Finish Phase 9 (current ~45% → target 100%)
-16. Install `@shadcn/ui` (or formally drop it from the spec) and either wire
-    `QueryClientProvider` for `@tanstack/react-query` or remove the dead dependency.
-17. `/task/[id]` — render the full lifecycle (PLAN row, nested spans, breaker trip, HITL, freeze,
-    thaw, gate, CAPO) as one replayable trajectory pointed at the now-real OTel spans (after Tier 0).
-18. `/tokens` — SQL-view layout + time-range selector + CSV export on this page.
-19. `/hitl` — real Monaco *diff* (original ↔ modified); Modify editable + OCC re-run on submit.
-20. `/crash` — re-run keyed on snapshot id.
-21. WebSocket store — add 5s poll fallback + reconnect.
-22. Auth — replace the hardcoded `admin-token-123` literal with a real PIN + HMAC-signed
-    `(ui, human)` tokens (depends on a backend signing endpoint).
-23. Top-bar global status pill across all pages.
-24. `next.config.js` — add the `/api` rewrite that `lib/api.ts:1` assumes (or fix `api.ts`).
-25. Pages — stop using silent `.catch(() => fakeDefault)`; surface real failures.
-26. Lighthouse a11y ≥ 95 config + assertion.
+| `/api` rewrite for client-side fetch | OPEN | **CLOSED** | ✅ `next.config.js` |
+| `/task/[id]` full lifecycle | MISSING | **MISSING** | ❌ still spans-only |
+| `/tokens` SQL+CSV+time-range | MISSING | **MISSING** | ❌ unchanged |
+| `/hitl` Monaco diff | PARTIAL | **PARTIAL** | ⚠️ still readOnly single editor |
+| `/crash` snapshot-id re-run | PARTIAL | **PARTIAL** | ⚠️ still task_id |
+| Playwright config | MISSING | **CLOSED** | ✅ `playwright.config.ts` |
+| 5s poll fallback | MISSING | **MISSING** | ❌ unchanged |
+| Real auth (PIN + signed tokens) | PARTIAL | **PARTIAL** | ⚠️ still hardcoded literal |
+| Top-bar global pill | PARTIAL | **PARTIAL** | ⚠️ still only on `/` |
+| shadcn/ui | MISSING | **MISSING** | ❌ not installed |
+| TanStack Query used | DEAD | **DEAD** | ❌ no QueryClientProvider |
+| Lighthouse a11y ≥ 95 | MISSING | **MISSING** | ❌ no config |
+| Silent `.catch()` fallbacks | OPEN | **OPEN** | ❌ unchanged |
 
 ### Tier 3 — Governance / contracts
-27. Author the 12 missing contracts (§8 #26), or formally mark them out-of-scope deviations.
-28. Flesh out the 4 new 3-line contracts to be enforceable.
-29. Strengthen `check_harness.py` further: assert `bindings` presence, append-only monotonicity
-    beyond `len(lines)` (e.g. hash chain), and a `ruff .` gate alongside the pytest gate.
-30. CI — `.github/workflows/ci.yml` exists; ensure it runs `pytest + ruff + check_harness.py + npm
-    test + npm run lint` and fails the build on red (it must be RED right now until Tier 0 lands).
+| Gap | v2 | v3 | Status |
+|---|---|---|---|
+| 12 missing contracts | OPEN | **OPEN** | ❌ unchanged |
+| 4 new contracts fleshed out | STUBS | **STUBS** | ❌ still 2-3 lines |
+| IMPLEMENT.md deviations table current | PARTIAL | **STALE** | ⚠️ doesn't reflect v3 work (P13/P22/P26/metering/etc.) |
+| `task_outcomes.db` fold-in deviation | OPEN | **OPEN** | ❌ not documented |
 
 ---
 
-## 11. Final Readiness Verdict (v2)
+## 9. Remaining Gaps
 
-| Question | v1 answer | v2 answer |
-|---|---|---|
-| Does the project boot and demonstrate the architecture? | Yes | **Unverified** — the OTel import at module top-level means `uvicorn context_server.app.main:app` will fail to start until the deps are installed. The app **does not currently boot** against a clean Python. |
-| Are all 10 phase rows marked done? | Yes | Yes (ledger unchanged this round for phase status; only "Deviations summary" + the P5-1 numeric were corrected) |
-| Do the shipped changes meet each phase doc's DoD? | Mixed | Phase 0 ✅, Phase 1 ✅ (upgraded), Phase 2 ⚠️ (improved but OTel-broken), Phase 3 ✅ (upgraded), Phase 4 ✅ (upgraded), Phase 5 ⚠️ (unchanged + RED), Phase 6 ⚠️ (improved but P22/P26 still partial), Phase 7 ⚠️ (metering still unwired), Phase 8 ✅, Phase 9 ❌ (now ~45%, gate broken) |
-| Are tests / lint / validator green? | Yes (nominally) | **NO — regression across all three backend gates + frontend `npm test` RED** |
-| Is it ready to use as the spec defines? | No, not yet | **No — and currently less usable than v1 because the gates are red.** |
+Consolidated, de-duplicated list of gaps still open after v3.
 
-### Summary verdict (v2)
+### Blocker tier (must fix before commit)
+1. **ruff: 23 violations** — `ruff check context_server --fix` (resolves 22) + rename `l` →
+   `line_` at `main.py:320` (E741). **~2 minutes. This is the only RED gate.**
 
-- **Backend code is meaningfully better than v1**: log_decision, content-hash OCC, durable
-  breaker/rate-limit, lock-DAG cycle detection, widened DLP, real (in-code) OTel/Lamport/failure-class,
-  a crash re-run endpoint, a strengthened `check_harness.py`, OKF bundle structure, OKF frontmatter,
-  the corrected flag and ledger. Most P0 + P1 items from `project_gaps.md` are genuinely closed.
+### Backend behavioral (still open)
+2. **Real drift detection (P30)** — temporal + Jaccard token-overlap is present but not a real
+   vector store with embeddings. Upgrade to real embeddings for production-grade drift.
+3. **P26 crash reconciliation — remaining 2 sub-items**: close OTel spans as
+   `infrastructure_crash`; rollback to snapshot (currently only finalizes PLAN rows + reaps locks).
+4. **Secrets rotation + ephemeral credential injection (P11)** — still env passthrough only.
+5. **Dream-Cycle**: no recorded accepted proposal in `Program.md` (the proposal section exists
+   but has no promoted/accepted items).
+6. **`hooks/task_outcomes.db`** — arch Phase 7 calls for a separate denominator file; currently
+   CAPO denominator lives in `token_ledger.accepted`. Either create the file or document the
+   fold-in as a deviation in `IMPLEMENT.md`.
+7. **`registry/log.md` week rollup** — file exists (3 lines) but contains no rollup data.
 
-- **BUT the repo is currently RED and unbootable** because the OTel packages were added to
-  `requirements.txt` but never installed, breaking `pytest`, `ruff` (cascading), `check_harness.py`,
-  and the app's own `uvicorn` start. The frontend `npm test` is also RED due to a missing
-  Playwright config + a vitest exclusion. These are **cheap blocker fixes** (Tier 0 above) — none
-  require reverting the good work.
+### Frontend (Phase 9) — still missing
+8. **`/task/[id]` full task lifecycle view** — PLAN row → spans → breaker → HITL → freeze → thaw
+   → gate → CAPO. Currently spans-only.
+9. **`/tokens`** — SQL-view layout, time-range selector, CSV export on this page.
+10. **`/hitl` real Monaco *diff*** (original ↔ modified) with editable right pane; Modify must
+    let the user edit content and re-run OCC.
+11. **`/crash` re-run keyed on snapshot id**, not just task_id.
+12. **5s poll fallback** on the WebSocket store (with reconnect logic).
+13. **Real auth** — local PIN + HMAC-signed `(ui, human)` tokens, not hardcoded literal.
+14. **Top-bar global status pill** across all pages (currently only on `/`).
+15. **`@shadcn/ui`** — install or formally drop from spec.
+16. **`@tanstack/react-query`** — add `QueryClientProvider` in `layout.tsx` or remove the dead dep.
+17. **Lighthouse a11y ≥ 95** — no config or assertion.
+18. **Silent `.catch(() => fakeDefault)` fallbacks** — pages mask real backend failures; should
+    surface errors.
 
-- **Phase 9 frontend moved ~20 percentage points (25% → ~45%)** — real Tailwind, real Zustand+WS,
-  left rail, auth skeleton, Monaco import, CSV export, crash re-run, Playwright package. Still missing
-  the heavy items: full task lifecycle, real monaco **diff**, `/tokens` SQL+CSV+time-range, PIN/signed
-  auth, top-bar pill, shadcn, configured Playwright, Lighthouse, poll fallback.
+### Contracts / governance
+19. **12 contracts still missing** — `identity`, `secrets_bridge`, `read_chaperon`,
+    `circuit_breaker`, `rate_limit`, `project_contract`, `obsidian_export_hook`,
+    `delta_indexing`, `permission_matrix`, `hibernation`, `crash_recovery`, `lock_manager`.
+20. **4 new contracts are 2-3 line stubs** — `dlp.md`, `mcp_tools.md`, `observability.md`,
+    `occ.md` need fleshing out to be enforceable.
+21. **`IMPLEMENT.md` deviations table is stale** — doesn't reflect the v3 work (P13, P22, P26,
+    metering, accept_implement file-write, HITL routing, bindings, Program.md, generator script).
+    The ledger rows also still show the old dates; the new work is unlogged.
+22. **`check_harness.py` could be stronger** — add a `ruff .` gate alongside the pytest gate;
+    assert `bindings` presence; hash-chain append-only monotonicity.
 
-- **Several v1 behavioral gaps were NOT touched** by the `project_gaps.md` round and remain open:
-  per-tool metering (the heart of accurate CAPO), `accept_implement` writing the IMPLEMENT.md file,
-  HITL→orchestrator routing, full P22 hibernation lifecycle, full P26 crash reconciliation (re-run
-  endpoint excepted), P13 lethal-trifecta, P30 real drift, the Phase 5 generator, `Program.md`, and
-  `bindings`.
+---
 
-### Honest headline (v2)
+## 10. Final Readiness Verdict (v3)
 
-> The fixes are real and the code is closer to spec on every dimension the `project_gaps.md` plan
-> targeted. But the round shipped a **dependency-install regression** that made the project **less
-> verifiable than before**: pytest errors, ruff violations, `check_harness.py` fails, and `uvicorn`
-> won't start without the OTel packages. **Run Tier 0 (~10 min) to restore green gates**, then the
-> genuinely improved codebase can be trusted and the remaining Tier 1/2/3 gaps (§8) can be closed
-> next. Do **not** commit until Tier 0 is green — `AGENTS.md` Definition of Done requires it.
+| Question | v1 | v2 | v3 |
+|---|---|---|---|
+| Does the project boot? | Yes | No (OTel import crash) | **Yes** — deps installed, `uvicorn` starts |
+| Are all 10 phase rows marked done? | Yes | Yes | Yes (but ledger rows are stale — v3 work unlogged) |
+| Do shipped changes meet each phase DoD? | Mixed | Mixed | **Phases 0–8 ✅; Phase 9 ❌ (~50%)** |
+| Are tests/lint/validator green? | Yes (nominal) | **NO — regression** | **3 of 4 GREEN** (pytest✅, check_harness✅, npm test✅, npm lint✅); **ruff RED** |
+| Is per-tool CAPO metering real? | No | No | **Yes** — `meter_record()` at all 8 MCP sites |
+| Is the hibernation lifecycle real? | No | No | **Yes** — lock release/re-acquire + drift recheck |
+| Is crash reconciliation real? | No | Partial | **Yes** — crash/TTL distinguish + PLAN finalize |
+| Is it ready to use as the spec defines? | No | No (less usable than v1) | **Backend: yes (after ruff fix). Frontend: no (~50%).** |
+
+### Summary verdict (v3)
+
+- **The backend is the strongest it has ever been.** The v2 OTel regression is fixed. 10 of 13
+  v1/v2 behavioral gaps are genuinely closed in code: per-tool metering (the heart of CAPO),
+  `accept_implement` file-write, HITL→orchestrator routing, full P22 hibernation lifecycle, P26
+  crash reconciliation with PLAN finalization, P13 lethal-trifecta, P30 drift (temporal + semantic),
+  the Phase 5 generator, `Program.md` audit schedule, and `bindings` on all agents.
+
+- **The only RED gate is ruff (23 violations, 22 auto-fixable).** Run `ruff check context_server
+  --fix` + rename one variable. ~2 minutes to fully green.
+
+- **The frontend is ~50%** — the `/api` rewrite was fixed, Playwright is configured, but the
+  heavy items remain: full task lifecycle, Monaco *diff*, `/tokens` SQL+CSV, PIN/signed auth,
+  top-bar pill, shadcn, TanStack wiring, poll fallback, Lighthouse, and removing silent catch
+  fallbacks.
+
+- **Governance needs attention**: 12 contracts missing, 4 new contracts are stubs, and the
+  `IMPLEMENT.md` ledger/deviations table is stale (doesn't reflect the v3 work).
+
+### Honest headline (v3)
+
+> The backend has crossed the threshold from "partially working" to "substantively complete
+> against its own spec" — real per-tool CAPO metering, real hibernation lifecycle, real crash
+> reconciliation, lethal-trifecta enforcement, and a real IMPLEMENT.md file-write are all
+> shipped and tested. **Fix the 23 ruff violations (22 auto-fixable, ~2 min) to restore a fully
+> green gate set.** Then the remaining work is: frontend Phase 9 (the largest gap at ~50%),
+> contract authoring (12 missing + 4 stubs), secrets rotation (P11), and updating the
+> `IMPLEMENT.md` ledger to reflect the v3 work. The project is **usable for backend development
+> today** and **ready for a focused frontend sprint** to reach spec-complete.
