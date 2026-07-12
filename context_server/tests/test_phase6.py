@@ -12,6 +12,23 @@ def client():
         yield c
 
 
+@pytest.fixture(autouse=True)
+def clean_locks():
+    from context_server.app.db import init_db
+    init_db()
+    with connect(CONTROL_DB) as c:
+        try:
+            c.execute("DELETE FROM locks")
+        except Exception:
+            pass
+    yield
+    with connect(CONTROL_DB) as c:
+        try:
+            c.execute("DELETE FROM locks")
+        except Exception:
+            pass
+
+
 def test_phase6_out_of_matrix_write_denied(client):
     # 1. Out-of-matrix write is DENIED
     res = client.post(

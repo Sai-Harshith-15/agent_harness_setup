@@ -1,7 +1,7 @@
 """Snapshot and restore subsystem for crash rollback (Add-on 3.1)."""
 import os
-import sqlite3
 import shutil
+import sqlite3
 
 from ..db import CONTROL_DB, TOKEN_DB, _path, connect
 

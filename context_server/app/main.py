@@ -164,7 +164,7 @@ resource = Resource.create({"service.name": "context_server"})
 provider = TracerProvider(resource=resource)
 if os.environ.get("ENABLE_OTEL", "true").lower() not in ("0", "false", "no"):
     if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("TEST_MODE") == "true":
-        from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult, SimpleSpanProcessor
+        from opentelemetry.sdk.trace.export import SimpleSpanProcessor, SpanExporter, SpanExportResult
         class NoOpSpanExporter(SpanExporter):
             def export(self, spans): return SpanExportResult.SUCCESS
             def shutdown(self): pass

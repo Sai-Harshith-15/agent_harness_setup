@@ -56,7 +56,9 @@ async def test_phase7_finops_metering_and_rollups():
 
 
 def test_phase7_finops_endpoints(client, monkeypatch):
+    from context_server.app.db import init_db
     from context_server.app.obsidian_backend import backend
+    init_db()
 
     # Insert spend
     record("hermes", "task-3", "search", 1000, 500, accepted=True)

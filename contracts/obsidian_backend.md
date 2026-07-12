@@ -10,3 +10,4 @@
   so a thaw re-issue / breaker retry / crash-reconcile replay cannot double-append.
 - OCC: read_note attaches a version hash; a human mid-flight edit surfaces as a state_changed
   rejection on the next agent write, never a silent overwrite.
+- Data Role: `D:\obsidianData` is strictly vault plumbing (sync and plugin config) and is NOT a knowledge layer.

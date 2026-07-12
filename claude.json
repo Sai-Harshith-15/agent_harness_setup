@@ -1,0 +1,12 @@
+{
+    "env": {
+        "ANTHROPIC_API_KEY": "fe_oa_411a8778a11d4999f07dd2bcd26a91a07b6ab82f68ea0890",
+        "ANTHROPIC_BASE_URL": "https://cc.freemodel.dev",
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+    },
+    "permissions": {
+        "allow": [],
+        "deny": []
+    },
+    "apiKeyHelper": "echo 'fe_oa_411a8778a11d4999f07dd2bcd26a91a07b6ab82f68ea0890'"
+}

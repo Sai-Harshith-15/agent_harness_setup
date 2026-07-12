@@ -10,6 +10,7 @@
 ## Audit Schedule
 - Daily: Review open hitl_queue items.
 - Weekly: Crash reconciliation snapshot review.
+- **Quarterly:** Removal-condition audit — next: 2026-10-12 (see demo_project_reference/okf/architecture/adr-002-removal-audit.md)
 
 ## Now
 - [ ] (PROG-1) Replace EchoAdapter with real filesystem + HTTP agent runners (Phase 3 seam)
