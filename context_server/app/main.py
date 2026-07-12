@@ -20,24 +20,27 @@ from .db import CONTROL_DB, audit, connect, init_db
 from .delegation import delegate_task as _delegate_task
 from .finops.meter import mark_accepted
 from .finops.meter import record as meter_record
-from .finops.rollups import capo, capo_trend, heatmap, totals_by_task, raw_ledger
+from .finops.rollups import capo, capo_trend, heatmap, raw_ledger, totals_by_task
 from .finops.standup import post_standup
 from .governance.hibernation import hibernate, thaw
 from .governance.hitl import enqueue, init_hitl, open_items, resolve
 from .governance.locks import check_occ, governed_write
 from .governance.permissions import can_write
 from .governance.reconcile import reconcile
+from .governance.secrets_bridge import bridge as secrets_bridge
 from .identity import AgentIdentity, require_identity
 from .indexing.compactor import compact
 from .indexing.drift import detect_drift
 from .indexing.graphify import graphify
 from .indexing.headroom import Headroom
-from .indexing.store import all_edges, all_nodes
+from .indexing.store import all_edges, all_nodes, init_index
 from .indexing.watcher import watch_and_index
 from .meta.dream_cycle import analyze
 from .meta.runner import run_dream_cycle
 from .middlewares import DLPFilter, PolicyMiddleware
 from .obsidian_backend import backend
+from .okf_backend import get_concept as okf_get_concept
+from .okf_backend import search_okf as okf_search
 from .registry import find_capability, load_agents, lookup_agent, orchestrator_id
 
 # Simple in-memory event bus for websocket
@@ -78,7 +81,7 @@ async def _dream_loop():
     failures = 0
     while True:
         now = datetime.now()
-        target = datetime.combine(now.date(), time(3, 0))   # 3am local
+        target = datetime.combine(now.date(), time(3, 0))
         if now >= target:
             target += timedelta(days=1)
         await asyncio.sleep((target - now).total_seconds())
@@ -92,22 +95,52 @@ async def _dream_loop():
             if failures >= 3:
                 await asyncio.sleep(min(300, 2 ** failures))
 
+async def _secrets_rotation_loop():
+    failures = 0
+    while True:
+        await asyncio.sleep(3600)
+        try:
+            rotated = secrets_bridge.auto_rotate_expired()
+            if rotated:
+                audit("system", "secrets-bridge", "auto_rotate", True, f"rotated={','.join(rotated)}")
+        except Exception as e:
+            failures += 1
+            print(f"[secrets-bridge] rotation check failed ({failures}):", e)
+            if failures >= 3:
+                await asyncio.sleep(min(300, 2 ** failures))
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
     init_hitl()
-    
-    # Configure Langfuse for LLM traces (Gap 3.3)
-    if os.environ.get("LANGFUSE_PUBLIC_KEY"):
+    init_index()
+
+    # Configure Langfuse for LLM + agent traces (Gap 3.3)
+    if os.environ.get("ENABLE_LANGFUSE", "").lower() in ("1", "true", "yes"):
+        try:
+            from langfuse import Langfuse
+            app.state.langfuse = Langfuse(
+                public_key=os.environ.get("LANGFUSE_PUBLIC_KEY", ""),
+                secret_key=os.environ.get("LANGFUSE_SECRET_KEY", ""),
+                host=os.environ.get("LANGFUSE_HOST", "http://localhost:3001"),
+            )
+            print("[boot] Langfuse tracing enabled")
+        except ImportError:
+            print("[boot] Langfuse SDK not installed; run: pip install langfuse")
+        except Exception as e:
+            print(f"[boot] Langfuse init failed: {e}")
+
         try:
             import litellm
             litellm.success_callback = ["langfuse"]
+            litellm.failure_callback = ["langfuse"]
         except ImportError:
             pass
-            
+
     print("[boot] crash reconciliation:", reconcile(startup=True))   # reap crash-orphaned leases
     asyncio.create_task(_daily_standup_loop())
     asyncio.create_task(_dream_loop())
+    asyncio.create_task(_secrets_rotation_loop())
     # ENABLE_WATCHER defaults to true; tests set it to 'false' so the
     # background file-watcher never starts and can never block teardown.
     if os.environ.get("ENABLE_WATCHER", "true").lower() not in ("0", "false", "no"):
@@ -130,7 +163,14 @@ app = FastAPI(title="Agentic OS Context Server", version="0.2.0", lifespan=lifes
 resource = Resource.create({"service.name": "context_server"})
 provider = TracerProvider(resource=resource)
 if os.environ.get("ENABLE_OTEL", "true").lower() not in ("0", "false", "no"):
-    processor = BatchSpanProcessor(OTLPSpanExporter(endpoint="http://localhost:4317", insecure=True))
+    if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("TEST_MODE") == "true":
+        from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult, SimpleSpanProcessor
+        class NoOpSpanExporter(SpanExporter):
+            def export(self, spans): return SpanExportResult.SUCCESS
+            def shutdown(self): pass
+        processor = SimpleSpanProcessor(NoOpSpanExporter())
+    else:
+        processor = BatchSpanProcessor(OTLPSpanExporter(endpoint="http://localhost:4317", insecure=True))
     provider.add_span_processor(processor)
 trace.set_tracer_provider(provider)
 FastAPIInstrumentor.instrument_app(app)
@@ -206,6 +246,11 @@ class AcceptBody(BaseModel):
     path: str
     task_id: str
     row_id: str
+
+class CredentialsBody(BaseModel):
+    service: str
+    sandbox_id: str = "default"
+    scope: str = "default"
 
 @app.get("/mcp/lookup_agent")
 async def lookup_agent_ep(agent_id: str, ident: AgentIdentity = Depends(require_identity)):
@@ -301,6 +346,123 @@ async def delegate_task_ep(body: DelegateBody, ident: AgentIdentity = Depends(re
     return {"ok": result.ok, "agent": result.agent, "output": result.output,
             "tokens_in": result.tokens_in, "tokens_out": result.tokens_out}
 
+@app.post("/mcp/search_okf")
+async def search_okf(body: SearchBody, ident: AgentIdentity = Depends(require_identity)):
+    results = okf_search(body.query)
+    notify_audit(ident.agent, ident.task_id, "search_okf", True, f"{len(results)} hits")
+    meter_record(ident.agent, ident.task_id, "search_okf")
+    return {"results": results}
+
+@app.get("/mcp/get_concept")
+async def get_concept_ep(concept_id: str, bundle: str | None = None, ident: AgentIdentity = Depends(require_identity)):
+    concept = okf_get_concept(concept_id, bundle)
+    if not concept:
+        raise HTTPException(status_code=404, detail=f"Concept '{concept_id}' not found")
+    concept["body"] = DLPFilter.scrub(concept.get("body", ""))
+    notify_audit(ident.agent, ident.task_id, "get_concept", True, concept_id)
+    meter_record(ident.agent, ident.task_id, "get_concept")
+    return concept
+
+@app.get("/mcp/search_tools")
+async def search_tools_ep(query: str | None = None, ident: AgentIdentity = Depends(require_identity)):
+    tool_schemas = [
+        {"tool_id": "search_tools", "description": "Search available MCP tools by description or name", "readOnlyHint": True},
+        {"tool_id": "load_tool_schema", "description": "Load full input/output schema for one tool", "readOnlyHint": True},
+        {"tool_id": "search_notes", "description": "Search Obsidian vault notes by query", "readOnlyHint": True},
+        {"tool_id": "read_note", "description": "Read a single Obsidian note by path", "readOnlyHint": True},
+        {"tool_id": "search_okf", "description": "Search OKF bundles for structured concepts", "readOnlyHint": True},
+        {"tool_id": "get_concept", "description": "Get one OKF concept by concept-id", "readOnlyHint": True},
+        {"tool_id": "lookup_agent", "description": "Look up a registered agent by id", "readOnlyHint": True},
+        {"tool_id": "find_capability", "description": "Find agents providing a capability", "readOnlyHint": True},
+        {"tool_id": "append_implement", "description": "Append to IMPLEMENT.md under a heading", "destructiveHint": True},
+        {"tool_id": "log_decision", "description": "Log a decision to a log.md heading", "destructiveHint": True},
+        {"tool_id": "delegate_task", "description": "Delegate a sub-task to another agent", "destructiveHint": True},
+        {"tool_id": "request_credentials", "description": "Request scoped ephemeral credentials", "destructiveHint": False},
+        {"tool_id": "request_clarification", "description": "Pause and request human input", "destructiveHint": False},
+        {"tool_id": "reindex", "description": "Re-index the codebase graph", "destructiveHint": False},
+        {"tool_id": "compress", "description": "Compress context to a token budget", "readOnlyHint": False},
+    ]
+    if query:
+        q = query.lower()
+        tool_schemas = [t for t in tool_schemas if q in t["tool_id"].lower() or q in t["description"].lower()]
+    notify_audit(ident.agent, ident.task_id, "search_tools", True, f"{len(tool_schemas)} results")
+    return {"tools": tool_schemas}
+
+@app.get("/mcp/load_tool_schema")
+async def load_tool_schema_ep(tool_id: str, ident: AgentIdentity = Depends(require_identity)):
+    schemas = {
+        "search_notes": {"input": {"query": "str"}, "output": {"results": "list[NoteMatch]"}},
+        "read_note": {"input": {"path": "str"}, "output": "NoteContent", "headers": ["X-Version"]},
+        "search_okf": {"input": {"query": "str", "bundle?": "str"}, "output": {"results": "list[ConceptMatch]"}},
+        "get_concept": {"input": {"concept_id": "str", "bundle?": "str"}, "output": "ConceptContent", "headers": ["X-Version"]},
+        "lookup_agent": {"input": {"agent_id": "str"}, "output": "AgentEntry"},
+        "find_capability": {"input": {"capability": "str"}, "output": {"agents": "list[str]"}},
+        "append_implement": {"input": {"path": "str", "target": "str", "content": "str", "expected_version?": "str"}, "output": {"ok": "bool"}},
+        "log_decision": {"input": {"path": "str", "target": "str", "content": "str", "expected_version?": "str"}, "output": {"ok": "bool"}},
+        "delegate_task": {"input": {"target_agent": "str", "prompt": "str"}, "output": {"ok": "bool", "agent": "str", "output": "str"}},
+        "request_credentials": {"input": {"service": "str", "sandbox_id?": "str"}, "output": {"ok": "bool", "env_injected": "list[str]"}},
+        "request_clarification": {"input": {"question": "str"}, "output": {"paused": "bool", "hitl_item": "int"}},
+        "reindex": {"input": {}, "output": {"added": "int", "skipped": "int"}},
+        "compress": {"input": {"budget_tokens": "int"}, "output": {"kept": "list[str]", "collapsed_nodes": "int"}},
+    }
+    schema = schemas.get(tool_id)
+    if not schema:
+        raise HTTPException(status_code=404, detail=f"Unknown tool '{tool_id}'")
+    notify_audit(ident.agent, ident.task_id, "load_tool_schema", True, tool_id)
+    return {"tool_id": tool_id, "schema": schema}
+
+@app.post("/mcp/acquire_lock")
+async def acquire_lock_ep(resource: str, ttl_s: int = 120, ident: AgentIdentity = Depends(require_identity)):
+    from .governance.locks import acquire_lock
+    try:
+        acquire_lock(resource, ident.agent, ident.task_id)
+        notify_audit(ident.agent, ident.task_id, "acquire_lock", True, f"acquired {resource}")
+        return {"ok": True, "resource": resource, "lease_expires_at": None}
+    except HTTPException:
+        raise
+    except Exception as e:
+        notify_audit(ident.agent, ident.task_id, "acquire_lock", False, str(e))
+        raise HTTPException(status_code=409, detail=str(e))
+
+@app.post("/mcp/request_snapshot")
+async def request_snapshot_ep(label: str | None = None, ident: AgentIdentity = Depends(require_identity)):
+    from .governance.snapshot import create_snapshot
+    try:
+        create_snapshot(ident.task_id)
+        notify_audit(ident.agent, ident.task_id, "request_snapshot", True, f"snapshot {ident.task_id}")
+        return {"ok": True, "snapshot_id": ident.task_id}
+    except Exception as e:
+        notify_audit(ident.agent, ident.task_id, "request_snapshot", False, str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/mcp/request_credentials")
+async def request_credentials(body: CredentialsBody, ident: AgentIdentity = Depends(require_identity)):
+    try:
+        result = secrets_bridge.request_credentials(body.service, body.sandbox_id, body.scope)
+        notify_audit(ident.agent, ident.task_id, "request_credentials", True,
+                     f"service={body.service} sandbox={body.sandbox_id}")
+        meter_record(ident.agent, ident.task_id, "request_credentials")
+        return result
+    except ValueError as e:
+        notify_audit(ident.agent, ident.task_id, "request_credentials", False, str(e))
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        notify_audit(ident.agent, ident.task_id, "request_credentials", False, str(e))
+        raise HTTPException(status_code=500, detail="Secrets bridge error")
+
+@app.post("/mcp/rotate_credentials")
+async def rotate_credentials(service: str, ident: AgentIdentity = Depends(require_identity)):
+    try:
+        result = secrets_bridge.rotate_credential(service)
+        notify_audit(ident.agent, ident.task_id, "rotate_credentials", True, f"service={service}")
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/dashboard/secrets")
+async def dashboard_secrets():
+    return {"services": secrets_bridge.list_services()}
+
 @app.post("/mcp/accept_implement")
 async def accept_implement(body: AcceptBody, ident: AgentIdentity = Depends(require_identity)):
     if ident.agent != orchestrator_id():
@@ -388,12 +550,12 @@ async def dashboard_task(task_id: str):
     with connect(CONTROL_DB) as c:
         spans = c.execute("SELECT id, ts, agent, tool, ok, detail FROM audit_log WHERE task_id=? ORDER BY ts", (task_id,)).fetchall()
         hitl = c.execute("SELECT id, status, resolution, ts FROM hitl_queue WHERE task_id=? ORDER BY ts", (task_id,)).fetchall()
-        crashes = c.execute("SELECT reason, frozen_state, created_at FROM hibernated_tasks WHERE task_id=?", (task_id,)).fetchall()
-    
+        crashes = c.execute("SELECT reason, frozen_state, created_at FROM hibernation WHERE task_id=?", (task_id,)).fetchall()
+
     from .db import TOKEN_DB
     with connect(TOKEN_DB) as tc:
         tokens = tc.execute("SELECT agent, input_tokens, output_tokens, model, cost_usd FROM token_ledger WHERE task_id=?", (task_id,)).fetchall()
-    
+
     return {
         "task_id": task_id,
         "spans": spans,

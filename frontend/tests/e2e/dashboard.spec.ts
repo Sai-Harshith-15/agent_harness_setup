@@ -1,6 +1,11 @@
 import { test, expect } from '@playwright/test';
 
 test.describe('Mission Control Dashboard', () => {
+  test.beforeEach(async ({ page }) => {
+    await page.route('**/health', route => route.fulfill({ json: { status: 'ok', obsidian_backend: true } }));
+    await page.route('**/dashboard/state', route => route.fulfill({ json: { locks: [], recent_activity: [], agents: [], tasks: [], stalls: [] } }));
+  });
+
   test('redirects to login when unauthenticated', async ({ page }) => {
     await page.goto('/');
     await expect(page).toHaveURL(/.*\/login/);

@@ -140,3 +140,36 @@ def test_phase6_crash_reconciliation(client, monkeypatch):
 
     orphans = [r["task_id"] for r in data["hibernated_orphans"]]
     assert "orphan-99" in orphans
+
+
+def test_phase6_crash_reconcile_span_and_snapshot(monkeypatch):
+    """Gap 1.1: verify startup reconciliation emits OTel span (infrastructure_crash)
+    and calls restore_snapshot for crashed locks."""
+    from datetime import datetime, timedelta, timezone
+    from unittest.mock import patch
+
+    from context_server.app.db import CONTROL_DB, connect, init_db
+    from context_server.app.governance.reconcile import reconcile
+
+    init_db()
+
+    # Insert an expired lock that simulates a crash-orphaned lease
+    with connect(CONTROL_DB) as c:
+        c.execute("DELETE FROM locks")
+        expired_at = (datetime.now(timezone.utc) - timedelta(seconds=300)).isoformat()
+        c.execute(
+            "INSERT INTO locks (resource, agent, task_id, lease_expires_at) VALUES (?, ?, ?, ?)",
+            ("crash/test.md", "hermes", "task-crash-span", expired_at),
+        )
+
+    # Mock restore_snapshot to verify it gets called
+    with patch("context_server.app.governance.snapshot.restore_snapshot") as mock_restore:
+        result = reconcile(startup=True)
+
+    # Verify the crash was detected
+    assert len(result["crashes"]) >= 1
+    crash_resources = [c["resource"] for c in result["crashes"]]
+    assert "crash/test.md" in crash_resources
+
+    # Verify restore_snapshot was called with the crashed task_id
+    mock_restore.assert_called_with("task-crash-span")

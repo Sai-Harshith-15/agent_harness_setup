@@ -4,13 +4,15 @@ import Home from '../app/page';
 
 // Mock fetch for the async Server Component
 global.fetch = vi.fn((url) => {
-  if (url.includes('/health')) {
+  if (typeof url === 'string' && url.includes('/health')) {
     return Promise.resolve({
+      ok: true,
       json: () => Promise.resolve({ status: 'ok', obsidian_backend: true }),
     });
   }
-  if (url.includes('/dashboard/state')) {
+  if (typeof url === 'string' && url.includes('/dashboard/state')) {
     return Promise.resolve({
+      ok: true,
       json: () => Promise.resolve({ locks: [], recent_activity: [] }),
     });
   }

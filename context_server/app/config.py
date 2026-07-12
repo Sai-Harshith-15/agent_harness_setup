@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     obsidian_cert_path: str | None = None
     allow_http_fallback: bool = True
     dlp_hit_policy: str = "redact"  # redact | block | quarantine
+    enable_secrets_rotation: bool = True
 
     context_server_host: str = "127.0.0.1"
     context_server_port: int = 27180

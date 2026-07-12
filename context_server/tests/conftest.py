@@ -1,34 +1,22 @@
-"""Shared test fixtures for the context_server test suite.
-
-pytest_configure runs before any test module is imported, so setting
-ENABLE_WATCHER=false here guarantees the background watcher is never
-started by the server lifespan during any test.
-"""
 import os
 
+import pytest
 
-def pytest_configure(config):
-    """Disable the file watcher before any module is imported by tests."""
-    os.environ["ENABLE_WATCHER"] = "false"
-    os.environ["ENABLE_OTEL"] = "false"
-
-
-import pytest  # noqa: E402
+# Suppress OTel export noise in tests (no Jaeger running) and disable file watcher
+os.environ.setdefault("ENABLE_OTEL", "false")
+os.environ.setdefault("ENABLE_WATCHER", "false")
 
 
-@pytest.fixture(autouse=True)
-def _init_test_db(tmp_path, monkeypatch):
-    """Per-test: redirect hooks to a fresh tmp dir and initialise both DBs."""
-    monkeypatch.setenv("HOOKS_DIR", str(tmp_path))
-
-    from context_server.app.config import settings
-    monkeypatch.setattr(settings, "hooks_dir", str(tmp_path))
-
-    from context_server.app.db import init_db
-    init_db()
-
-    # Also initialise the codebase-memory index DB so all_nodes/all_edges work
-    from context_server.app.indexing.store import init_index
-    init_index()
-
+@pytest.fixture(autouse=True, scope="session")
+def clean_hooks_db():
+    hooks_dir = os.path.join(os.path.dirname(__file__), "..", "..", "..", "hooks")
+    for db_file in ["control_plane.db", "token_usage.db"]:
+        path = os.path.join(hooks_dir, db_file)
+        if os.path.exists(path):
+            os.remove(path)
     yield
+    for db_file in ["control_plane.db", "token_usage.db"]:
+        path = os.path.join(hooks_dir, db_file)
+        if os.path.exists(path):
+            os.remove(path)
+

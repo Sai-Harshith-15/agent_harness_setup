@@ -37,3 +37,4 @@
 
 ## Phase 9 — Next.js Mission Control (full pages)
 - [done] (P9-1) Full Mission Control UI pages | agent=opencode capo=0 tokens=0
+- [delegated] (task-42.hermes.1) delegate:hermes | agent=hermes

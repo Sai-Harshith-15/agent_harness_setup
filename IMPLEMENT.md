@@ -18,6 +18,7 @@
 | 7 | P7-1 | FinOps metering, rollups, and standup wired | antigravity | true | 2026-07-08 |
 | 8 | P8-1 | Dream Cycle analysis and nightly runner wired | antigravity | true | 2026-07-08 |
 | 9 | P9-1 | Mission Control Next.js frontend pages and dashboard/plan parser | antigravity | true | 2026-07-08 |
+| 9 | P9-2 | Audit: Playwright fails due to nextjs backend fetch, vitest fixed | antigravity | true | 2026-07-12 |
 
 ---
 

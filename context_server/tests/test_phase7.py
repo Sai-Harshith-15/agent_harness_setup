@@ -13,6 +13,13 @@ def client():
 
 @pytest.mark.asyncio
 async def test_phase7_finops_metering_and_rollups():
+    from context_server.app.db import TOKEN_DB, connect, init_db
+    init_db()
+
+    # Clear any rows left by prior tests so this test has a deterministic baseline
+    with connect(TOKEN_DB) as c:
+        c.execute("DELETE FROM token_ledger")
+
     # 1. Insert some spend
     record("hermes", "task-1", "search", 100, 50, accepted=False)
     record("hermes", "task-1", "read", 20, 10, accepted=False)

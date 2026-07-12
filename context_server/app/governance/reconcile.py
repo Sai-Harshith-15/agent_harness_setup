@@ -40,6 +40,7 @@ def reconcile(startup: bool = False) -> dict:
         try:
             from opentelemetry import trace
             from opentelemetry.trace.status import Status, StatusCode
+
             from .snapshot import restore_snapshot
             tracer = trace.get_tracer(__name__)
             agent, task_id = r["was"].split(":", 1)

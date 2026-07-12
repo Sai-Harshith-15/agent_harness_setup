@@ -4,7 +4,7 @@ type Row = { status: string; id: string; title: string; agent: string; capo: num
 const COLUMNS = ["backlog", "in-progress", "delegated", "awaiting-hitl", "hibernated", "done", "rejected"];
 
 async function getPlan(): Promise<Row[]> {
-  try { return (await api<{ rows: Row[] }>("/dashboard/plan")).rows; } catch { return []; }
+  return (await api<{ rows: Row[] }>("/dashboard/plan")).rows;
 }
 
 export default async function Kanban() {

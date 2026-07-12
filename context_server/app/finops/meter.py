@@ -5,12 +5,12 @@ from ..db import TOKEN_DB, connect
 
 
 def record(agent: str, task_id: str, tool: str, tokens_in: int = 0, tokens_out: int = 0,
-           accepted: bool = False) -> None:
+           model: str = "", cost_usd: float = 0.0, accepted: bool = False) -> None:
     with connect(TOKEN_DB) as c:
         c.execute(
-            "INSERT INTO token_ledger (agent, task_id, tool, tokens_in, tokens_out, accepted) "
-            "VALUES (?,?,?,?,?,?)",
-            (agent, task_id, tool, tokens_in, tokens_out, 1 if accepted else 0),
+            "INSERT INTO token_ledger (agent, task_id, tool, tokens_in, tokens_out, model, cost_usd, accepted) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (agent, task_id, tool, tokens_in, tokens_out, model, cost_usd, 1 if accepted else 0),
         )
 
 

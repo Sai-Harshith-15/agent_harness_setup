@@ -9,9 +9,9 @@ export default function Hitl() {
   const [error, setError] = useState<string | null>(null);
 
   const load = () => fetch("http://127.0.0.1:27180/dashboard/hitl")
-    .then((r) => { if (!r.ok) throw new Error("Failed to load"); return r.json(); })
+    .then((r) => { if (!r.ok) throw new Error(`hitl -> ${r.status}`); return r.json(); })
     .then((d) => { setItems(d.open || []); setError(null); })
-    .catch((e) => { setItems([]); setError(e.message); });
+    .catch((e) => { setItems([]); setError(e instanceof Error ? `${e.message}\n${e.stack || ''}` : String(e)); });
   useEffect(() => { load(); const t = setInterval(load, 4000); return () => clearInterval(t); }, []);
 
   async function resolve(status: string) {

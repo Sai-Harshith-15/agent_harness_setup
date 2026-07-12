@@ -1,11 +1,13 @@
 """Script to generate YAML config for downstream integrators based on the agent registry."""
 import os
 import sys
+
 import yaml
 
 # Add context_server to path to import registry
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "context_server"))
 from app.registry import load_agents
+
 
 def main():
     agents = load_agents()

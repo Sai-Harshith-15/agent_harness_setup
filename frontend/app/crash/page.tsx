@@ -2,13 +2,14 @@
 import { useEffect, useState } from "react";
 
 export default function Crash() {
+  const [data, setData] = useState<{ released_locks: any[]; hibernated_orphans: any[] }>({ released_locks: [], hibernated_orphans: [] });
   const [error, setError] = useState<string | null>(null);
 
   const load = () => {
     fetch("http://127.0.0.1:27180/dashboard/crashes")
-      .then(r => { if (!r.ok) throw new Error("Failed to load crashes"); return r.json(); })
+      .then(r => { if (!r.ok) throw new Error(`crashes -> ${r.status}`); return r.json(); })
       .then(d => { setData(d); setError(null); })
-      .catch(e => { setData({ released_locks: [], hibernated_orphans: [] }); setError(e.message); });
+      .catch(e => { setData({ released_locks: [], hibernated_orphans: [] }); setError(e instanceof Error ? e.message : String(e)); });
   };
 
   useEffect(() => {

@@ -27,6 +27,8 @@ CREATE TABLE IF NOT EXISTS token_ledger (
     tool TEXT NOT NULL,
     tokens_in INTEGER NOT NULL DEFAULT 0,
     tokens_out INTEGER NOT NULL DEFAULT 0,
+    model TEXT NOT NULL DEFAULT '',
+    cost_usd REAL NOT NULL DEFAULT 0.0,
     accepted INTEGER NOT NULL DEFAULT 0
 );
 """
@@ -58,13 +60,35 @@ CREATE TABLE IF NOT EXISTS audit_log (
 CREATE TABLE IF NOT EXISTS breaker_state (
     agent TEXT NOT NULL,
     tool TEXT NOT NULL,
-    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    arg_hash TEXT NOT NULL DEFAULT '',
+    trip_count INTEGER NOT NULL DEFAULT 0,
     last_trip_time REAL NOT NULL DEFAULT 0,
-    PRIMARY KEY (agent, tool)
+    is_half_open INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (agent, tool, arg_hash)
 );
 CREATE TABLE IF NOT EXISTS rate_limits (
     agent TEXT NOT NULL,
-    timestamp REAL NOT NULL
+    tool TEXT NOT NULL DEFAULT '',
+    timestamp REAL NOT NULL,
+    weight INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS dlp_quarantine (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,
+    hash6 TEXT NOT NULL,
+    original_text TEXT NOT NULL,
+    source TEXT NOT NULL,
+    agent TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    reviewed INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS credential_leases (
+    cred_id TEXT PRIMARY KEY,
+    service TEXT NOT NULL,
+    sandbox_id TEXT NOT NULL,
+    issued_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
 );
 """
 
@@ -112,8 +136,33 @@ def audit(agent: str, task_id: str, tool: str, ok: bool, detail: str = "") -> No
             span.set_attribute("lamport_seq", _next_lamport())
             if not ok:
                 span.set_status(Status(StatusCode.ERROR))
-                # basic failure class heuristic
-                fail_class = "auth" if "DENY" in detail else "system"
+                # Rich failure classification (Phase 2.5)
+                if "identity_spoof" in detail:
+                    fail_class = "identity_spoof_attempt"
+                elif "circuit_breaker" in detail:
+                    fail_class = "circuit_breaker"
+                elif "rate_limited" in detail:
+                    fail_class = "rate_limited"
+                elif "state_changed" in detail:
+                    fail_class = "state_changed"
+                elif "deadlock" in detail:
+                    fail_class = "planning"
+                elif "DENY" in detail:
+                    fail_class = "constraint"
+                elif "dlp_blocked" in detail or "dlp_quarantined" in detail:
+                    fail_class = "dlp_blocked" if "dlp_blocked" in detail else "dlp_quarantined"
+                elif "secret_redacted" in detail or "pii_redacted" in detail:
+                    fail_class = "secret_redacted" if "secret_redacted" in detail else "pii_redacted"
+                elif "permission" in detail.lower():
+                    fail_class = "constraint"
+                elif "infrastructure_crash" in detail:
+                    fail_class = "infrastructure_crash"
+                elif "hibernation" in detail:
+                    fail_class = "hibernation_thaw"
+                elif "context" in detail.lower():
+                    fail_class = "context"
+                else:
+                    fail_class = "system"
                 span.set_attribute("failure_class", fail_class)
     except Exception:
         pass

@@ -7,7 +7,9 @@ git history — the shape stays the same.
 """
 import os
 from functools import lru_cache
+
 from .store import all_nodes
+
 
 @lru_cache(maxsize=1000)
 def get_embedding(text: str) -> list[float]:
@@ -18,6 +20,8 @@ def get_embedding(text: str) -> list[float]:
     try:
         from litellm import embedding
         response = embedding(model="text-embedding-3-small", input=[text])
+        if isinstance(response, dict):
+            return response["data"][0]["embedding"]
         return response.data[0]["embedding"]
     except Exception:
         return []

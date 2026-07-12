@@ -6,16 +6,18 @@ export default function Tokens() {
   const [raw, setRaw] = useState<any[]>([]);
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
+  const [error, setError] = useState<string | null>(null);
 
   const load = () => {
     Promise.all([
-      fetch("http://127.0.0.1:27180/dashboard/tokens").then(r => r.json()),
-      fetch("http://127.0.0.1:27180/dashboard/capo").then(r => r.json()),
-      fetch(`http://127.0.0.1:27180/dashboard/tokens/raw?start_date=${startDate}&end_date=${endDate}`).then(r => r.json())
+      fetch("http://127.0.0.1:27180/dashboard/tokens").then(r => { if (!r.ok) throw new Error(`tokens -> ${r.status}`); return r.json(); }),
+      fetch("http://127.0.0.1:27180/dashboard/capo").then(r => { if (!r.ok) throw new Error(`capo -> ${r.status}`); return r.json(); }),
+      fetch(`http://127.0.0.1:27180/dashboard/tokens/raw?start_date=${startDate}&end_date=${endDate}`).then(r => { if (!r.ok) throw new Error(`tokens/raw -> ${r.status}`); return r.json(); })
     ]).then(([tok, cpo, r]) => {
       setData({ by_task: tok.by_task || [], heatmap: tok.heatmap || [], capo: cpo.summary || {} });
       setRaw(r.rows || []);
-    }).catch(e => console.error("failed to load", e));
+      setError(null);
+    }).catch(e => { setData({ by_task: [], heatmap: [], capo: {} }); setRaw([]); setError(e instanceof Error ? e.message : String(e)); });
   };
 
   useEffect(() => { load(); }, [startDate, endDate]);
@@ -38,6 +40,7 @@ export default function Tokens() {
   return (
     <main style={{ padding: 24 }}>
       <h1>Token analytics</h1>
+      {error && <div style={{ color: "#ff7b72", padding: "12px 0" }}>Backend Error: {error}</div>}
       <p>CAPO: <strong>{data.capo.capo ?? "n/a"}</strong> tokens/accepted
          ({data.capo.accepted_tasks ?? 0} accepted, {data.capo.total_tokens ?? 0} total)</p>
 
