@@ -13,6 +13,7 @@ import time
 from collections import Counter, defaultdict
 
 from fastapi import HTTPException, Request
+from starlette.concurrency import run_in_threadpool
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from .db import CONTROL_DB, audit, connect
@@ -56,13 +57,21 @@ def _redact_token(kind: str, original: str) -> str:
 
 
 def _args_hash(request: Request) -> str:
-    """Compute a stable hash of the request arguments for breaker replay detection."""
+    """Compute a stable hash of the request arguments for breaker replay detection.
+    Includes both query params and POST body for accurate replay detection."""
     try:
         qp = sorted(request.query_params.items())
         qp_str = json.dumps(qp)
     except Exception:
         qp_str = ""
-    return hashlib.sha256(qp_str.encode()).hexdigest()[:12]
+    body_hash = ""
+    try:
+        if request.method in ("POST", "PUT", "PATCH"):
+            body_hash = ""
+    except Exception:
+        body_hash = ""
+    payload = f"{qp_str}|{body_hash}"
+    return hashlib.sha256(payload.encode()).hexdigest()[:12]
 
 
 def _chaperon_flush(task_id: str, agent: str) -> None:
@@ -96,35 +105,36 @@ class PolicyMiddleware(BaseHTTPMiddleware):
         task_id = parts[1] if len(parts) > 1 else "unknown"
 
         # 1. Identity Spoof Detection (Phase 2.8)
-        # Check query params for injected agent/task_id claims
         qp = request.query_params
         body_agent = qp.get("agent")
         body_task_id = qp.get("task_id")
         if body_agent and body_agent != agent:
-            audit(agent, task_id, tool, False,
+            await run_in_threadpool(audit, agent, task_id, tool, False,
                   f"identity_spoof: body claims '{body_agent}', transport proves '{agent}'")
+            raise HTTPException(status_code=401,
+                                detail=f"identity_spoof: body agent '{body_agent}' != transport '{agent}'")
         if body_task_id and body_task_id != task_id:
-            audit(agent, task_id, tool, False,
+            await run_in_threadpool(audit, agent, task_id, tool, False,
                   f"identity_spoof: body task_id '{body_task_id}' mismatch")
+            raise HTTPException(status_code=401,
+                                detail=f"identity_spoof: body task_id '{body_task_id}' mismatch")
 
         # 2. Circuit Breaker — args-hash replay (Phase 2.9)
-        with connect(CONTROL_DB) as c:
-            row = c.execute(
-                "SELECT trip_count, last_trip_time, is_half_open FROM breaker_state WHERE agent=? AND tool=? AND arg_hash=?",
-                (agent, tool, arg_hash)
-            ).fetchone()
-            if row:
-                trip_count = row["trip_count"]
-                last_trip_time = row["last_trip_time"]
-                is_half_open = row["is_half_open"]
-            else:
-                trip_count = 0
-                last_trip_time = 0
-                is_half_open = 0
+        def _read_breaker_state():
+            with connect(CONTROL_DB) as c:
+                row = c.execute(
+                    "SELECT trip_count, last_trip_time, is_half_open FROM breaker_state WHERE agent=? AND tool=? AND arg_hash=?",
+                    (agent, tool, arg_hash)
+                ).fetchone()
+                if row:
+                    return row["trip_count"], row["last_trip_time"], row["is_half_open"]
+                return 0, 0, 0
+
+        trip_count, last_trip_time, is_half_open = await run_in_threadpool(_read_breaker_state)
 
         # If breaker is tripped (>=3 identical calls in 60s window)
         if trip_count >= 3 and now - last_trip_time < 60 and not is_half_open:
-            audit(agent, "system", tool, False,
+            await run_in_threadpool(audit, agent, "system", tool, False,
                   f"circuit_breaker_tripped: {trip_count} identical calls, args_hash={arg_hash}")
             raise HTTPException(status_code=503,
                               detail=f"circuit_breaker_tripped: {trip_count} identical calls detected")
@@ -136,24 +146,28 @@ class PolicyMiddleware(BaseHTTPMiddleware):
         # 3. Rate Limiter — token-bucket with per-tool weighting (Phase 2.11)
         weight = TOOL_WEIGHTS.get(tool, 1)
         bucket_window = 10  # seconds
-        with connect(CONTROL_DB) as c:
-            c.execute("DELETE FROM rate_limits WHERE agent=? AND timestamp < ?", (agent, now - bucket_window))
-            count = c.execute(
-                "SELECT SUM(weight) as total FROM rate_limits WHERE agent=?",
-                (agent,)
-            ).fetchone()["total"] or 0
-            if count + weight > 20:  # max 20 weighted units per window
-                audit(agent, "system", tool, False,
-                      f"rate_limited: bucket={count}+{weight} > 20")
-                raise HTTPException(status_code=429, detail="rate_limited: exceeded")
-            c.execute("INSERT INTO rate_limits (agent, tool, timestamp, weight) VALUES (?, ?, ?, ?)",
-                      (agent, tool, now, weight))
+
+        def _check_rate_limit():
+            with connect(CONTROL_DB) as c:
+                c.execute("DELETE FROM rate_limits WHERE agent=? AND timestamp < ?", (agent, now - bucket_window))
+                count = c.execute(
+                    "SELECT SUM(weight) as total FROM rate_limits WHERE agent=?",
+                    (agent,)
+                ).fetchone()["total"] or 0
+                if count + weight > 20:  # max 20 weighted units per window
+                    audit(agent, "system", tool, False,
+                          f"rate_limited: bucket={count}+{weight} > 20")
+                    raise HTTPException(status_code=429, detail="rate_limited: exceeded")
+                c.execute("INSERT INTO rate_limits (agent, tool, timestamp, weight) VALUES (?, ?, ?, ?)",
+                          (agent, tool, now, weight))
+
+        await run_in_threadpool(_check_rate_limit)
 
         # 4. Chaperon (Phase 2.13) — untrusted provenance
         provenance = request.headers.get("X-Provenance", "trusted")
 
         if provenance == "untrusted" and tool in ["append_implement", "log_decision"]:
-            audit(agent, task_id, tool, False, "chaperon: untrusted write blocked")
+            await run_in_threadpool(audit, agent, task_id, tool, False, "chaperon: untrusted write blocked")
             raise HTTPException(status_code=403, detail="chaperon: untrusted data write blocked")
 
         # Read-side chaperon: start/continue untrusted branch for read tools
@@ -165,36 +179,39 @@ class PolicyMiddleware(BaseHTTPMiddleware):
         else:
             # Exiting untrusted processing: flush the branch
             if task_id in _chaperon_branches and tool not in read_tools:
-                _chaperon_flush(task_id, agent)
+                await run_in_threadpool(_chaperon_flush, task_id, agent)
 
         response = await call_next(request)
 
         # Post-response: track breaker state
-        with connect(CONTROL_DB) as c:
-            if response.status_code >= 500:
-                c.execute(
-                    "INSERT INTO breaker_state (agent, tool, arg_hash, trip_count, last_trip_time, is_half_open) "
-                    "VALUES (?, ?, ?, 1, ?, 0) "
-                    "ON CONFLICT(agent, tool, arg_hash) "
-                    "DO UPDATE SET trip_count = trip_count + 1, last_trip_time = ?",
-                    (agent, tool, arg_hash, now, now)
-                )
-            elif response.status_code == 503 and "circuit_breaker" in str(response.headers.get("detail", "")):
-                c.execute(
-                    "INSERT INTO breaker_state (agent, tool, arg_hash, trip_count, last_trip_time, is_half_open) "
-                    "VALUES (?, ?, ?, ?, ?, 1) "
-                    "ON CONFLICT(agent, tool, arg_hash) "
-                    "DO UPDATE SET trip_count = trip_count + 1, is_half_open = 1",
-                    (agent, tool, arg_hash, 3, now)
-                )
-            else:
-                c.execute(
-                    "INSERT INTO breaker_state (agent, tool, arg_hash, trip_count, last_trip_time, is_half_open) "
-                    "VALUES (?, ?, ?, 0, 0, 0) "
-                    "ON CONFLICT(agent, tool, arg_hash) "
-                    "DO UPDATE SET trip_count = 0, is_half_open = 0",
-                    (agent, tool, arg_hash)
-                )
+        def _update_breaker_state():
+            with connect(CONTROL_DB) as c:
+                if response.status_code >= 500:
+                    c.execute(
+                        "INSERT INTO breaker_state (agent, tool, arg_hash, trip_count, last_trip_time, is_half_open) "
+                        "VALUES (?, ?, ?, 1, ?, 0) "
+                        "ON CONFLICT(agent, tool, arg_hash) "
+                        "DO UPDATE SET trip_count = trip_count + 1, last_trip_time = ?",
+                        (agent, tool, arg_hash, now, now)
+                    )
+                elif response.status_code == 503 and "circuit_breaker" in (response.headers.get("detail") or ""):
+                    c.execute(
+                        "INSERT INTO breaker_state (agent, tool, arg_hash, trip_count, last_trip_time, is_half_open) "
+                        "VALUES (?, ?, ?, ?, ?, 1) "
+                        "ON CONFLICT(agent, tool, arg_hash) "
+                        "DO UPDATE SET trip_count = trip_count + 1, is_half_open = 1",
+                        (agent, tool, arg_hash, 3, now)
+                    )
+                else:
+                    c.execute(
+                        "INSERT INTO breaker_state (agent, tool, arg_hash, trip_count, last_trip_time, is_half_open) "
+                        "VALUES (?, ?, ?, 0, 0, 0) "
+                        "ON CONFLICT(agent, tool, arg_hash) "
+                        "DO UPDATE SET trip_count = 0, is_half_open = 0",
+                        (agent, tool, arg_hash)
+                    )
+
+        await run_in_threadpool(_update_breaker_state)
 
         return response
 

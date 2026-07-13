@@ -155,6 +155,16 @@
 
 ---
 
+## 2026-07-13 — Doc-drift correction (re-audit)
+
+Independent code verification found two entries in the Deviations summary below are stale:
+- `/mcp/log_decision route missing` — the route exists (`context_server/app/main.py`, `POST /mcp/log_decision`). This was already fixed at some prior point without the ledger being updated.
+- `sandbox/ stub removed` — `context_server/app/meta/sandbox.py` does not exist in the current tree; `meta/dream_cycle.py` and `meta/runner.py` are the live meta-harness modules and are imported by `main.py`. Treat the sandbox deviation as moot, not a removed stub.
+
+Also fixed this pass (High-severity gaps confirmed still open by re-audit, now closed):
+- **H3** — startup crash reconciliation (`context_server/app/governance/reconcile.py`) previously treated every lock row as a crash on startup regardless of lease validity. Now only reaps locks whose lease has actually expired, on both startup and steady-state paths — a live, non-expired lease is left alone instead of being misclassified as an infrastructure crash.
+- **H2** — synchronous SQLite calls were running directly inside `async def` route handlers and the `PolicyMiddleware.dispatch` hot path, blocking the event loop under contention. Wrapped all such calls (`main.py`, `middlewares.py`, `delegation.py`, `governance/locks.py`'s `governed_write` → new `governed_write_async`) in `starlette.concurrency.run_in_threadpool` so DB I/O runs off the event loop.
+
 <!-- Add new entries above this line. Oldest entries at the bottom. -->
 
 ## Deviations summary
@@ -164,10 +174,10 @@
 
 | Deviation | Reason | Plan updated? |
 |---|---|---|
-| /mcp/log_decision route missing | Oversight in initial FastAPI scaffolding | No |
+| ~~/mcp/log_decision route missing~~ | **STALE as of 2026-07-13** — route exists at `main.py` `POST /mcp/log_decision` | No |
 | `forbid_native_cross_agent` flag wrong | `cross_agent_delegation` used instead in `opencode.md` | No |
 | OKF concept frontmatter missing | Missed strict SPEC requirement | No |
-| `sandbox/` stub removed | Opted to not implement local containerization yet to reduce scope | Yes |
+| ~~`sandbox/` stub removed~~ | **STALE as of 2026-07-13** — no `meta/sandbox.py` exists in the tree; nothing to remove | Yes |
 
 ## Open questions (unresolved)
 

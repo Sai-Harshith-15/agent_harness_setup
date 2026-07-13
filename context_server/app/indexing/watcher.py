@@ -11,7 +11,12 @@ from .graphify import ROOT, graphify
 async def watch_and_index() -> None:
     graphify()  # initial full pass (delta-aware, so cheap on restart)
     try:
-        async for _changes in awatch(ROOT, recursive=True):
+        async for _changes in awatch(
+            ROOT,
+            watch_filter=lambda _c, p: not any(
+                skip in p for skip in ('.git', 'node_modules', '__pycache__', '.next', 'hooks', '.pytest_cache', '.ruff_cache', '.venv')
+            ),
+        ):
             stats = graphify()  # only changed hashes get re-indexed
             print(f"[delta-index] {stats}")
     except asyncio.CancelledError:

@@ -7,6 +7,8 @@ from datetime import datetime, time, timedelta
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.concurrency import run_in_threadpool
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
@@ -18,13 +20,14 @@ from pydantic import BaseModel
 from .config import settings
 from .db import CONTROL_DB, audit, connect, init_db
 from .delegation import delegate_task as _delegate_task
+from .episodic import persist_episodic, recall_episodic
 from .finops.meter import mark_accepted
 from .finops.meter import record as meter_record
 from .finops.rollups import capo, capo_trend, heatmap, raw_ledger, totals_by_task
 from .finops.standup import post_standup
 from .governance.hibernation import hibernate, thaw
 from .governance.hitl import enqueue, init_hitl, open_items, resolve
-from .governance.locks import check_occ, governed_write
+from .governance.locks import check_occ, governed_write_async
 from .governance.permissions import can_write
 from .governance.reconcile import reconcile
 from .governance.secrets_bridge import bridge as secrets_bridge
@@ -53,8 +56,9 @@ async def broadcast_event(event_data: dict):
         except Exception:
             dashboard_clients.discard(client)
 
-def notify_audit(agent, task_id, tool, ok, detail):
-    audit(agent, task_id, tool, ok, detail)
+async def notify_audit(agent, task_id, tool, ok, detail):
+    # Offload the blocking sqlite write to a worker thread so it doesn't stall the event loop.
+    await run_in_threadpool(audit, agent, task_id, tool, ok, detail)
     asyncio.create_task(broadcast_event({
         "type": "audit", "agent": agent, "task_id": task_id, "tool": tool, "ok": ok, "detail": detail
     }))
@@ -73,7 +77,7 @@ async def _daily_standup_loop():
         except Exception as e:
             failures += 1
             print(f"[standup] failed ({failures}):", e)
-            audit("system", "standup_loop", "post_standup", False, str(e))
+            await run_in_threadpool(audit, "system", "standup_loop", "post_standup", False, str(e))
             if failures >= 3:
                 await asyncio.sleep(min(300, 2 ** failures))
 
@@ -91,7 +95,7 @@ async def _dream_loop():
         except Exception as e:
             failures += 1
             print(f"[dream-cycle] failed ({failures}):", e)
-            audit("system", "dream_loop", "run_dream_cycle", False, str(e))
+            await run_in_threadpool(audit, "system", "dream_loop", "run_dream_cycle", False, str(e))
             if failures >= 3:
                 await asyncio.sleep(min(300, 2 ** failures))
 
@@ -100,9 +104,9 @@ async def _secrets_rotation_loop():
     while True:
         await asyncio.sleep(3600)
         try:
-            rotated = secrets_bridge.auto_rotate_expired()
+            rotated = await run_in_threadpool(secrets_bridge.auto_rotate_expired)
             if rotated:
-                audit("system", "secrets-bridge", "auto_rotate", True, f"rotated={','.join(rotated)}")
+                await run_in_threadpool(audit, "system", "secrets-bridge", "auto_rotate", True, f"rotated={','.join(rotated)}")
         except Exception as e:
             failures += 1
             print(f"[secrets-bridge] rotation check failed ({failures}):", e)
@@ -176,6 +180,13 @@ trace.set_tracer_provider(provider)
 FastAPIInstrumentor.instrument_app(app)
 
 app.add_middleware(PolicyMiddleware)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ---------- health + dashboard ----------
 @app.get("/health")
@@ -183,14 +194,18 @@ async def health():
     obs_ok = await backend.health()
     return {"status": "ok" if obs_ok else "degraded", "obsidian_backend": obs_ok}
 
-@app.get("/dashboard/state")
-async def dashboard_state():
+def _dashboard_state_sync():
     with connect(CONTROL_DB) as c:
         locks = [dict(r) for r in c.execute("SELECT * FROM locks").fetchall()]
         recent = [dict(r) for r in c.execute(
             "SELECT * FROM audit_log ORDER BY id DESC LIMIT 25").fetchall()]
         stalls = [dict(r) for r in c.execute("SELECT * FROM hitl_queue WHERE status='open'").fetchall()]
         tasks = [dict(r) for r in c.execute("SELECT DISTINCT task_id, agent FROM audit_log ORDER BY id DESC LIMIT 50").fetchall()]
+    return locks, recent, stalls, tasks
+
+@app.get("/dashboard/state")
+async def dashboard_state():
+    locks, recent, stalls, tasks = await run_in_threadpool(_dashboard_state_sync)
     agents = list(load_agents().values())
     return {"agents": agents, "tasks": tasks, "locks": locks, "recent_activity": recent, "stalls": stalls}
 
@@ -252,6 +267,10 @@ class CredentialsBody(BaseModel):
     sandbox_id: str = "default"
     scope: str = "default"
 
+class RememberBody(BaseModel):
+    content: str
+    role: str = "note"
+
 @app.get("/mcp/lookup_agent")
 async def lookup_agent_ep(agent_id: str, ident: AgentIdentity = Depends(require_identity)):
     meta = lookup_agent(agent_id)
@@ -271,11 +290,11 @@ async def search_notes(body: SearchBody, ident: AgentIdentity = Depends(require_
             for i in range(len(results)):
                 if "content" in results[i]:
                     results[i]["content"] = DLPFilter.scrub(results[i]["content"])
-        notify_audit(ident.agent, ident.task_id, "search_notes", True, f"{len(results)} hits")
-        meter_record(ident.agent, ident.task_id, "search_notes")
+        await notify_audit(ident.agent, ident.task_id, "search_notes", True, f"{len(results)} hits")
+        await run_in_threadpool(meter_record, ident.agent, ident.task_id, "search_notes")
         return {"results": results}
     except Exception as e:
-        notify_audit(ident.agent, ident.task_id, "search_notes", False, str(e))
+        await notify_audit(ident.agent, ident.task_id, "search_notes", False, str(e))
         raise HTTPException(status_code=502, detail="Obsidian backend error")
 
 @app.post("/mcp/read_note")
@@ -285,21 +304,21 @@ async def read_note(path: str, ident: AgentIdentity = Depends(require_identity))
         if "content" in note:
             note["version_hash"] = hashlib.sha256((note["content"] or "").encode("utf-8")).hexdigest()
             note["content"] = DLPFilter.scrub(note["content"])
-        notify_audit(ident.agent, ident.task_id, "read_note", True, path)
-        meter_record(ident.agent, ident.task_id, "read_note")
+        await notify_audit(ident.agent, ident.task_id, "read_note", True, path)
+        await run_in_threadpool(meter_record, ident.agent, ident.task_id, "read_note")
         return note
     except Exception as e:
-        notify_audit(ident.agent, ident.task_id, "read_note", False, str(e))
+        await notify_audit(ident.agent, ident.task_id, "read_note", False, str(e))
         raise HTTPException(status_code=502, detail="Obsidian backend error")
 
 @app.post("/mcp/append_implement")
 async def append_implement(body: GovernedAppendBody, ident: AgentIdentity = Depends(require_identity)):
-    decision = can_write(body.path, "heading", body.target, ident.agent, ident.task_id)   # permission matrix
+    decision = await run_in_threadpool(can_write, body.path, "heading", body.target, ident.agent, ident.task_id)   # permission matrix
     if not decision.allowed:
-        notify_audit(ident.agent, ident.task_id, "append_implement", False, f"DENY: {decision.reason}")
+        await notify_audit(ident.agent, ident.task_id, "append_implement", False, f"DENY: {decision.reason}")
         raise HTTPException(status_code=403, detail=decision.reason)
 
-    with governed_write(body.path, ident.agent, ident.task_id):
+    async with governed_write_async(body.path, ident.agent, ident.task_id):
         try:
             note = await backend.read_note(body.path)             # OCC read
             current_version = hashlib.sha256((note.get("content") or "").encode("utf-8")).hexdigest()
@@ -307,23 +326,23 @@ async def append_implement(body: GovernedAppendBody, ident: AgentIdentity = Depe
             scrubbed_content = DLPFilter.scrub(body.content)
             await backend.patch(body.path, "heading", body.target, scrubbed_content,
                                 reject_if_preexists=True)         # idempotent write
-            notify_audit(ident.agent, ident.task_id, "append_implement", True, f"{body.path}#{body.target}")
-            meter_record(ident.agent, ident.task_id, "append_implement")
+            await notify_audit(ident.agent, ident.task_id, "append_implement", True, f"{body.path}#{body.target}")
+            await run_in_threadpool(meter_record, ident.agent, ident.task_id, "append_implement")
             return {"ok": True}
         except HTTPException:
             raise
         except Exception as e:
-            notify_audit(ident.agent, ident.task_id, "append_implement", False, str(e))
+            await notify_audit(ident.agent, ident.task_id, "append_implement", False, str(e))
             raise HTTPException(status_code=502, detail="Obsidian backend error")
 
 @app.post("/mcp/log_decision")
 async def log_decision(body: GovernedAppendBody, ident: AgentIdentity = Depends(require_identity)):
-    decision = can_write(body.path, "heading", body.target, ident.agent, ident.task_id)   # permission matrix
+    decision = await run_in_threadpool(can_write, body.path, "heading", body.target, ident.agent, ident.task_id)   # permission matrix
     if not decision.allowed:
-        notify_audit(ident.agent, ident.task_id, "log_decision", False, f"DENY: {decision.reason}")
+        await notify_audit(ident.agent, ident.task_id, "log_decision", False, f"DENY: {decision.reason}")
         raise HTTPException(status_code=403, detail=decision.reason)
 
-    with governed_write(body.path, ident.agent, ident.task_id):
+    async with governed_write_async(body.path, ident.agent, ident.task_id):
         try:
             note = await backend.read_note(body.path)             # OCC read
             current_version = hashlib.sha256((note.get("content") or "").encode("utf-8")).hexdigest()
@@ -331,13 +350,13 @@ async def log_decision(body: GovernedAppendBody, ident: AgentIdentity = Depends(
             scrubbed_content = DLPFilter.scrub(body.content)
             await backend.patch(body.path, "heading", body.target, scrubbed_content,
                                 reject_if_preexists=True)         # idempotent write
-            notify_audit(ident.agent, ident.task_id, "log_decision", True, f"{body.path}#{body.target}")
-            meter_record(ident.agent, ident.task_id, "log_decision")
+            await notify_audit(ident.agent, ident.task_id, "log_decision", True, f"{body.path}#{body.target}")
+            await run_in_threadpool(meter_record, ident.agent, ident.task_id, "log_decision")
             return {"ok": True}
         except HTTPException:
             raise
         except Exception as e:
-            notify_audit(ident.agent, ident.task_id, "log_decision", False, str(e))
+            await notify_audit(ident.agent, ident.task_id, "log_decision", False, str(e))
             raise HTTPException(status_code=502, detail="Obsidian backend error")
 
 @app.post("/mcp/delegate_task")
@@ -349,8 +368,8 @@ async def delegate_task_ep(body: DelegateBody, ident: AgentIdentity = Depends(re
 @app.post("/mcp/search_okf")
 async def search_okf(body: SearchBody, ident: AgentIdentity = Depends(require_identity)):
     results = okf_search(body.query)
-    notify_audit(ident.agent, ident.task_id, "search_okf", True, f"{len(results)} hits")
-    meter_record(ident.agent, ident.task_id, "search_okf")
+    await notify_audit(ident.agent, ident.task_id, "search_okf", True, f"{len(results)} hits")
+    await run_in_threadpool(meter_record, ident.agent, ident.task_id, "search_okf")
     return {"results": results}
 
 @app.get("/mcp/get_concept")
@@ -359,8 +378,8 @@ async def get_concept_ep(concept_id: str, bundle: str | None = None, ident: Agen
     if not concept:
         raise HTTPException(status_code=404, detail=f"Concept '{concept_id}' not found")
     concept["body"] = DLPFilter.scrub(concept.get("body", ""))
-    notify_audit(ident.agent, ident.task_id, "get_concept", True, concept_id)
-    meter_record(ident.agent, ident.task_id, "get_concept")
+    await notify_audit(ident.agent, ident.task_id, "get_concept", True, concept_id)
+    await run_in_threadpool(meter_record, ident.agent, ident.task_id, "get_concept")
     return concept
 
 @app.get("/mcp/search_tools")
@@ -381,11 +400,13 @@ async def search_tools_ep(query: str | None = None, ident: AgentIdentity = Depen
         {"tool_id": "request_clarification", "description": "Pause and request human input", "destructiveHint": False},
         {"tool_id": "reindex", "description": "Re-index the codebase graph", "destructiveHint": False},
         {"tool_id": "compress", "description": "Compress context to a token budget", "readOnlyHint": False},
+        {"tool_id": "remember", "description": "Append to shared episodic memory for this task", "destructiveHint": True},
+        {"tool_id": "recall", "description": "Recall shared episodic memory for this task", "readOnlyHint": True},
     ]
     if query:
         q = query.lower()
         tool_schemas = [t for t in tool_schemas if q in t["tool_id"].lower() or q in t["description"].lower()]
-    notify_audit(ident.agent, ident.task_id, "search_tools", True, f"{len(tool_schemas)} results")
+    await notify_audit(ident.agent, ident.task_id, "search_tools", True, f"{len(tool_schemas)} results")
     return {"tools": tool_schemas}
 
 @app.get("/mcp/load_tool_schema")
@@ -404,73 +425,75 @@ async def load_tool_schema_ep(tool_id: str, ident: AgentIdentity = Depends(requi
         "request_clarification": {"input": {"question": "str"}, "output": {"paused": "bool", "hitl_item": "int"}},
         "reindex": {"input": {}, "output": {"added": "int", "skipped": "int"}},
         "compress": {"input": {"budget_tokens": "int"}, "output": {"kept": "list[str]", "collapsed_nodes": "int"}},
+        "remember": {"input": {"content": "str", "role?": "str"}, "output": {"ok": "bool", "task_id": "str"}},
+        "recall": {"input": {"limit?": "int"}, "output": {"task_id": "str", "memory": "list[dict]", "count": "int"}},
     }
     schema = schemas.get(tool_id)
     if not schema:
         raise HTTPException(status_code=404, detail=f"Unknown tool '{tool_id}'")
-    notify_audit(ident.agent, ident.task_id, "load_tool_schema", True, tool_id)
+    await notify_audit(ident.agent, ident.task_id, "load_tool_schema", True, tool_id)
     return {"tool_id": tool_id, "schema": schema}
 
 @app.post("/mcp/acquire_lock")
 async def acquire_lock_ep(resource: str, ttl_s: int = 120, ident: AgentIdentity = Depends(require_identity)):
     from .governance.locks import acquire_lock
     try:
-        acquire_lock(resource, ident.agent, ident.task_id)
-        notify_audit(ident.agent, ident.task_id, "acquire_lock", True, f"acquired {resource}")
+        await run_in_threadpool(acquire_lock, resource, ident.agent, ident.task_id)
+        await notify_audit(ident.agent, ident.task_id, "acquire_lock", True, f"acquired {resource}")
         return {"ok": True, "resource": resource, "lease_expires_at": None}
     except HTTPException:
         raise
     except Exception as e:
-        notify_audit(ident.agent, ident.task_id, "acquire_lock", False, str(e))
+        await notify_audit(ident.agent, ident.task_id, "acquire_lock", False, str(e))
         raise HTTPException(status_code=409, detail=str(e))
 
 @app.post("/mcp/request_snapshot")
 async def request_snapshot_ep(label: str | None = None, ident: AgentIdentity = Depends(require_identity)):
     from .governance.snapshot import create_snapshot
     try:
-        create_snapshot(ident.task_id)
-        notify_audit(ident.agent, ident.task_id, "request_snapshot", True, f"snapshot {ident.task_id}")
+        await run_in_threadpool(create_snapshot, ident.task_id)
+        await notify_audit(ident.agent, ident.task_id, "request_snapshot", True, f"snapshot {ident.task_id}")
         return {"ok": True, "snapshot_id": ident.task_id}
     except Exception as e:
-        notify_audit(ident.agent, ident.task_id, "request_snapshot", False, str(e))
+        await notify_audit(ident.agent, ident.task_id, "request_snapshot", False, str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/mcp/request_credentials")
 async def request_credentials(body: CredentialsBody, ident: AgentIdentity = Depends(require_identity)):
     try:
-        result = secrets_bridge.request_credentials(body.service, body.sandbox_id, body.scope)
-        notify_audit(ident.agent, ident.task_id, "request_credentials", True,
+        result = await run_in_threadpool(secrets_bridge.request_credentials, body.service, body.sandbox_id, body.scope)
+        await notify_audit(ident.agent, ident.task_id, "request_credentials", True,
                      f"service={body.service} sandbox={body.sandbox_id}")
-        meter_record(ident.agent, ident.task_id, "request_credentials")
+        await run_in_threadpool(meter_record, ident.agent, ident.task_id, "request_credentials")
         return result
     except ValueError as e:
-        notify_audit(ident.agent, ident.task_id, "request_credentials", False, str(e))
+        await notify_audit(ident.agent, ident.task_id, "request_credentials", False, str(e))
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        notify_audit(ident.agent, ident.task_id, "request_credentials", False, str(e))
+        await notify_audit(ident.agent, ident.task_id, "request_credentials", False, str(e))
         raise HTTPException(status_code=500, detail="Secrets bridge error")
 
 @app.post("/mcp/rotate_credentials")
 async def rotate_credentials(service: str, ident: AgentIdentity = Depends(require_identity)):
     try:
-        result = secrets_bridge.rotate_credential(service)
-        notify_audit(ident.agent, ident.task_id, "rotate_credentials", True, f"service={service}")
+        result = await run_in_threadpool(secrets_bridge.rotate_credential, service)
+        await notify_audit(ident.agent, ident.task_id, "rotate_credentials", True, f"service={service}")
         return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.get("/dashboard/secrets")
-async def dashboard_secrets():
-    return {"services": secrets_bridge.list_services()}
+async def dashboard_secrets(ident: AgentIdentity = Depends(require_identity)):
+    return {"services": await run_in_threadpool(secrets_bridge.list_services)}
 
 @app.post("/mcp/accept_implement")
 async def accept_implement(body: AcceptBody, ident: AgentIdentity = Depends(require_identity)):
     if ident.agent != orchestrator_id():
         raise HTTPException(status_code=403, detail="Only the orchestrator may accept IMPLEMENT rows")
-    mark_accepted(body.task_id)
+    await run_in_threadpool(mark_accepted, body.task_id)
 
     # Phase 6.3: physically append the accepted row to IMPLEMENT.md
-    import datetime
+    from datetime import datetime as dt
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     plan_path = os.path.join(root, "PLAN.md")
     title = body.row_id
@@ -484,13 +507,15 @@ async def accept_implement(body: AcceptBody, ident: AgentIdentity = Depends(requ
                 agent = m.group("agent")
                 break
 
-    impl_path = os.path.join(root, body.path)
+    impl_path = os.path.normpath(os.path.join(root, body.path))
+    if not os.path.commonpath([os.path.abspath(impl_path), root]) == root:
+        raise HTTPException(status_code=400, detail="Path traversal denied")
     if os.path.exists(impl_path):
         with open(impl_path, "r", encoding="utf-8") as f:
             lines = f.read().split("\n")
         out_lines = []
         inserted = False
-        new_row = f"| {phase} | {body.row_id} | {title} | {agent} | true | {datetime.datetime.now().strftime('%Y-%m-%d')} |"
+        new_row = f"| {phase} | {body.row_id} | {title} | {agent} | true | {dt.now().strftime('%Y-%m-%d')} |"
         for line in lines:
             if line.startswith("---") and not inserted and any("| phase |" in line_ for line_ in out_lines):
                 out_lines.append(new_row)
@@ -501,17 +526,16 @@ async def accept_implement(body: AcceptBody, ident: AgentIdentity = Depends(requ
         with open(impl_path, "w", encoding="utf-8") as f:
             f.write("\n".join(out_lines))
 
-    notify_audit(ident.agent, ident.task_id, "accept_implement", True, f"{body.path}#{body.row_id}")
+    await notify_audit(ident.agent, ident.task_id, "accept_implement", True, f"{body.path}#{body.row_id}")
     return {"ok": True, "accepted": body.row_id}
 
 @app.post("/mcp/request_clarification")
 async def request_clarification(body: ClarifyBody, ident: AgentIdentity = Depends(require_identity)):
-    hibernate(ident.task_id, ident.agent, reason="awaiting-hitl",
-              frozen_state={"question": body.question, "diff": body.proposed_diff})
-    item_id = enqueue(ident.task_id, ident.agent, body.question, body.proposed_diff)
-    notify_audit(ident.agent, ident.task_id, "request_clarification", True, f"queued #{item_id}")
+    await run_in_threadpool(hibernate, ident.task_id, ident.agent, "awaiting-hitl",
+              {"question": body.question, "diff": body.proposed_diff})
+    item_id = await run_in_threadpool(enqueue, ident.task_id, ident.agent, body.question, body.proposed_diff)
+    await notify_audit(ident.agent, ident.task_id, "request_clarification", True, f"queued #{item_id}")
 
-    # Route to orchestrator in the background (Phase 6.5)
     import asyncio
 
     from .adapters import adapter_for
@@ -527,26 +551,45 @@ async def request_clarification(body: ClarifyBody, ident: AgentIdentity = Depend
 
     return {"paused": True, "hitl_item": item_id}
 
+# ---------- Gate 1: Episodic memory MCP routes ----------
+
+@app.post("/mcp/remember")
+async def remember(body: RememberBody, ident: AgentIdentity = Depends(require_identity)):
+    await run_in_threadpool(persist_episodic, ident.task_id, ident.agent, body.role, body.content)
+    await notify_audit(ident.agent, ident.task_id, "remember", True, f"role={body.role} len={len(body.content)}")
+    await run_in_threadpool(meter_record, ident.agent, ident.task_id, "remember")
+    return {"ok": True, "task_id": ident.task_id}
+
+
+@app.get("/mcp/recall")
+async def recall(limit: int = 50, ident: AgentIdentity = Depends(require_identity)):
+    rows = await run_in_threadpool(recall_episodic, ident.task_id, min(limit, 200))
+    await notify_audit(ident.agent, ident.task_id, "recall", True, f"{len(rows)} rows returned")
+    await run_in_threadpool(meter_record, ident.agent, ident.task_id, "recall")
+    return {"task_id": ident.task_id, "memory": rows, "count": len(rows)}
+
 @app.get("/dashboard/hitl")
 async def dashboard_hitl():
-    return {"open": open_items()}
+    return {"open": await run_in_threadpool(open_items)}
 
-@app.patch("/dashboard/hitl")
-async def resolve_hitl(body: ResolveBody):
-    resolve(body.item_id, body.status, body.resolution)
-    if body.status in ("approved", "modified"):
+def _resolve_hitl_sync(item_id, status, resolution):
+    resolve(item_id, status, resolution)
+    if status in ("approved", "modified"):
         with connect(CONTROL_DB) as c:
-            row = c.execute("SELECT task_id FROM hitl_queue WHERE id=?", (body.item_id,)).fetchone()
+            row = c.execute("SELECT task_id FROM hitl_queue WHERE id=?", (item_id,)).fetchone()
         if row:
             thaw(row["task_id"])
+
+@app.patch("/dashboard/hitl")
+async def resolve_hitl(body: ResolveBody, ident: AgentIdentity = Depends(require_identity)):
+    await run_in_threadpool(_resolve_hitl_sync, body.item_id, body.status, body.resolution)
     return {"ok": True, "status": body.status}
 
 @app.get("/dashboard/crashes")
 async def dashboard_crashes():
-    return reconcile()
+    return await run_in_threadpool(reconcile)
 
-@app.get("/dashboard/task/{task_id}")
-async def dashboard_task(task_id: str):
+def _dashboard_task_sync(task_id):
     with connect(CONTROL_DB) as c:
         spans = c.execute("SELECT id, ts, agent, tool, ok, detail FROM audit_log WHERE task_id=? ORDER BY ts", (task_id,)).fetchall()
         hitl = c.execute("SELECT id, status, resolution, ts FROM hitl_queue WHERE task_id=? ORDER BY ts", (task_id,)).fetchall()
@@ -554,8 +597,13 @@ async def dashboard_task(task_id: str):
 
     from .db import TOKEN_DB
     with connect(TOKEN_DB) as tc:
-        tokens = tc.execute("SELECT agent, input_tokens, output_tokens, model, cost_usd FROM token_ledger WHERE task_id=?", (task_id,)).fetchall()
+        tokens = tc.execute("SELECT agent, tokens_in, tokens_out, model, cost_usd FROM token_ledger WHERE task_id=?", (task_id,)).fetchall()
 
+    return spans, hitl, crashes, tokens
+
+@app.get("/dashboard/task/{task_id}")
+async def dashboard_task(task_id: str):
+    spans, hitl, crashes, tokens = await run_in_threadpool(_dashboard_task_sync, task_id)
     return {
         "task_id": task_id,
         "spans": spans,
@@ -565,29 +613,33 @@ async def dashboard_task(task_id: str):
     }
 
 @app.post("/dashboard/crashes/{task_id}/rerun")
-async def dashboard_crashes_rerun(task_id: str):
-    thaw(task_id)
+async def dashboard_crashes_rerun(task_id: str, ident: AgentIdentity = Depends(require_identity)):
+    await run_in_threadpool(thaw, task_id)
     return {"ok": True, "task_id": task_id, "status": "thawed"}
 
 # ---------- Phase 7: FinOps ----------
 
 @app.get("/dashboard/tokens")
 async def dashboard_tokens():
-    return {"by_task": totals_by_task(), "heatmap": heatmap()}
+    by_task = await run_in_threadpool(totals_by_task)
+    hm = await run_in_threadpool(heatmap)
+    return {"by_task": by_task, "heatmap": hm}
 
 @app.get("/dashboard/tokens/raw")
 async def dashboard_tokens_raw(start_date: str | None = None, end_date: str | None = None):
-    return {"rows": raw_ledger(start_date, end_date)}
+    return {"rows": await run_in_threadpool(raw_ledger, start_date, end_date)}
 
 @app.get("/dashboard/capo")
 async def dashboard_capo():
-    return {"summary": capo(), "trend": capo_trend()}
+    summary = await run_in_threadpool(capo)
+    trend = await run_in_threadpool(capo_trend)
+    return {"summary": summary, "trend": trend}
 
 @app.post("/mcp/post_standup")
 async def post_standup_ep(ident: AgentIdentity = Depends(require_identity)):
     result = await post_standup()
-    audit(ident.agent, ident.task_id, "post_standup", True, result["path"])
-    meter_record(ident.agent, ident.task_id, "post_standup")
+    await run_in_threadpool(audit, ident.agent, ident.task_id, "post_standup", True, result["path"])
+    await run_in_threadpool(meter_record, ident.agent, ident.task_id, "post_standup")
     return result
 
 @app.websocket("/dashboard/tokens/ws")
@@ -595,7 +647,9 @@ async def tokens_ws(ws: WebSocket):
     await ws.accept()
     try:
         while True:
-            await ws.send_json({"by_task": totals_by_task(), "capo": capo()})
+            by_task = await run_in_threadpool(totals_by_task)
+            c = await run_in_threadpool(capo)
+            await ws.send_json({"by_task": by_task, "capo": c})
             await asyncio.sleep(3)
     except WebSocketDisconnect:
         pass
@@ -607,29 +661,31 @@ async def tokens_ws(ws: WebSocket):
 
 @app.post("/mcp/reindex")
 async def reindex(ident: AgentIdentity = Depends(require_identity)):
-    stats = graphify()
-    audit(ident.agent, ident.task_id, "reindex", True, str(stats))
-    meter_record(ident.agent, ident.task_id, "reindex")
+    stats = await run_in_threadpool(graphify)
+    await run_in_threadpool(audit, ident.agent, ident.task_id, "reindex", True, str(stats))
+    await run_in_threadpool(meter_record, ident.agent, ident.task_id, "reindex")
     return stats
 
 
 @app.post("/mcp/compress")
 async def compress(budget_tokens: int = 4000, ident: AgentIdentity = Depends(require_identity)):
-    result = compact(budget_tokens)
-    audit(ident.agent, ident.task_id, "compress", True,
+    result = await run_in_threadpool(compact, budget_tokens)
+    await run_in_threadpool(audit, ident.agent, ident.task_id, "compress", True,
           f"kept={len(result['kept'])} collapsed={result['collapsed_nodes']}")
-    meter_record(ident.agent, ident.task_id, "compress")
+    await run_in_threadpool(meter_record, ident.agent, ident.task_id, "compress")
     return result
 
 
 @app.get("/dashboard/graph")
 async def dashboard_graph():
-    return {"nodes": all_nodes(), "edges": all_edges()}
+    nodes = await run_in_threadpool(all_nodes)
+    edges = await run_in_threadpool(all_edges)
+    return {"nodes": nodes, "edges": edges}
 
 
 @app.get("/dashboard/drift")
 async def dashboard_drift():
-    return {"banners": detect_drift()}
+    return {"banners": await run_in_threadpool(detect_drift)}
 
 
 @app.get("/dashboard/headroom")
@@ -663,7 +719,7 @@ async def dashboard_plan():
 @app.get("/dashboard/dream")
 async def dashboard_dream():
     # Preview proposals WITHOUT writing (for the UI 'dry run' button).
-    return {"proposals": analyze()}
+    return {"proposals": await run_in_threadpool(analyze)}
 
 
 @app.post("/mcp/run_dream_cycle")
@@ -672,10 +728,10 @@ async def run_dream_cycle_ep(ident: AgentIdentity = Depends(require_identity)):
     if ident.agent not in ("meta", "opencode"):
         raise HTTPException(status_code=403, detail="Only meta or opencode may run the Dream Cycle")
     result = await run_dream_cycle()
-    audit(ident.agent, ident.task_id, "run_dream_cycle", result["ok"],
+    await run_in_threadpool(audit, ident.agent, ident.task_id, "run_dream_cycle", result["ok"],
           f"{len(result.get('proposals', []))} proposals")
     if result["ok"]:
-        meter_record(ident.agent, ident.task_id, "run_dream_cycle")
+        await run_in_threadpool(meter_record, ident.agent, ident.task_id, "run_dream_cycle")
     return result
 
 

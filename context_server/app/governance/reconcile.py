@@ -1,6 +1,7 @@
 """Crash reconciliation (Phase 6.7). On startup (or on demand): reap expired lock
 leases as crash_recovery, surface orphaned in-flight tasks, and expose a re-run hook.
 """
+import os
 from datetime import datetime, timezone
 
 from ..db import CONTROL_DB, audit, connect
@@ -15,12 +16,16 @@ def reconcile(startup: bool = False) -> dict:
     with connect(CONTROL_DB) as c:
         for row in c.execute("SELECT * FROM locks").fetchall():
             is_expired = datetime.fromisoformat(row["lease_expires_at"]) <= now
-            if startup or is_expired:
-                if startup:
-                    crashes.append({"resource": row["resource"], "was": f"{row['agent']}:{row['task_id']}"})
-                else:
-                    reaped.append({"resource": row["resource"], "was": f"{row['agent']}:{row['task_id']}"})
-                c.execute("DELETE FROM locks WHERE resource=?", (row["resource"],))
+            if not is_expired:
+                # Lease is still live: this may be a task still legitimately in-flight
+                # across the restart, not a crash orphan. Leave it — it will either be
+                # renewed by its owner or reaped here once the lease actually expires.
+                continue
+            if startup:
+                crashes.append({"resource": row["resource"], "was": f"{row['agent']}:{row['task_id']}"})
+            else:
+                reaped.append({"resource": row["resource"], "was": f"{row['agent']}:{row['task_id']}"})
+            c.execute("DELETE FROM locks WHERE resource=?", (row["resource"],))
 
         try:
             # Table might not have expires_at if it's an old DB without migrations
@@ -41,7 +46,6 @@ def reconcile(startup: bool = False) -> dict:
             from opentelemetry import trace
             from opentelemetry.trace.status import Status, StatusCode
 
-            from .snapshot import restore_snapshot
             tracer = trace.get_tracer(__name__)
             agent, task_id = r["was"].split(":", 1)
             with tracer.start_as_current_span("crash_reconcile") as span:
@@ -49,21 +53,21 @@ def reconcile(startup: bool = False) -> dict:
                 span.set_attribute("task_id", task_id)
                 span.set_attribute("agent", agent)
                 span.set_status(Status(StatusCode.ERROR, "infrastructure_crash"))
-            restore_snapshot(task_id)
+            if os.environ.get("CRASH_RESTORE_SNAPSHOT", "").lower() in ("1", "true", "yes"):
+                from .snapshot import restore_snapshot
+                restore_snapshot(task_id)
         except Exception as e:
             print("[reconcile] Failed to rollback/span for crash:", e)
     for r_id in rejected_hitl:
         audit("system", "crash-reconcile", "hitl_expire", True, f"hitl item {r_id} auto-expired")
 
-    if startup and crashes:
-        import os
+    if startup and crashes and os.environ.get("CRASH_REWRITE_PLAN", "").lower() in ("1", "true", "yes"):
         import re
         root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         plan_path = os.path.join(root, "PLAN.md")
         if os.path.exists(plan_path):
             with open(plan_path, "r", encoding="utf-8") as f:
                 content = f.read()
-            # finalize in-progress rows
             content = re.sub(r"- \[in-progress\]", "- [crash]", content)
             content = re.sub(r"- \[delegated\]", "- [crash]", content)
             with open(plan_path, "w", encoding="utf-8") as f:

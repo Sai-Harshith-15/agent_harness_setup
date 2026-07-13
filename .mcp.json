@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "headroom": {
+      "command": "headroom",
+      "args": ["proxy"]
+    },
+    "ponytail": {
+      "command": "ponytail"
+    }
+  }
+}

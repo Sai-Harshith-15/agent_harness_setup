@@ -4,7 +4,10 @@ All store operations run against an isolated tmp-dir SQLite so the production
 hooks/ directory is never touched during CI.
 """
 import pytest
+from conftest import make_identity
 from fastapi.testclient import TestClient
+
+AGENT_HDR = {"X-Agent-Identity": make_identity("opencode", "task-5")}
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -27,9 +30,6 @@ def client(isolate_hooks):
     from context_server.app.main import app
     with TestClient(app, raise_server_exceptions=True) as c:
         yield c
-
-
-AGENT_HDR = {"X-Agent-Identity": "opencode:task-5:cafcf1f5e41e92278232127fc77d69215b9161eb43e65b2d0e459e0158a9c731"}
 
 
 # ---------------------------------------------------------------------------

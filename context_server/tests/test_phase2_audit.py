@@ -138,3 +138,57 @@ def test_search_tools_progressive_discovery(client):
     assert "search_tools" in tools
     assert "load_tool_schema" in tools
     assert "delegate_task" in tools
+
+
+def test_h2_sync_db_calls_do_not_block_event_loop():
+    """H2 regression: PolicyMiddleware and route handlers must offload sqlite calls
+    (via run_in_threadpool) rather than call them directly inside async def, which
+    would block the single-threaded event loop under concurrent load.
+
+    We can't easily benchmark loop responsiveness in-process with TestClient (it
+    runs synchronously), so this asserts the structural fix directly: no bare
+    (non-threadpooled) `audit(`/`meter_record(`/`connect(` call remains in the
+    top-level body of an `async def` (nested nested plain `def` helpers, which are
+    legitimately dispatched via `run_in_threadpool` at their call site, are excluded).
+    """
+    import inspect
+    import re
+    import textwrap
+
+    from context_server.app import main as main_mod
+    from context_server.app import middlewares as mw_mod
+
+    def _strip_nested_def_bodies(src: str) -> str:
+        lines = src.splitlines()
+        out = []
+        skip_indent = None
+        for line in lines:
+            stripped = line.strip()
+            if skip_indent is not None:
+                if line[:1] in (" ", "\t") and (len(line) - len(line.lstrip())) > skip_indent:
+                    continue
+                skip_indent = None
+            if re.match(r"def\s+\w+\(", stripped) and not stripped.startswith("async def"):
+                skip_indent = len(line) - len(line.lstrip())
+                continue
+            out.append(line)
+        return "\n".join(out)
+
+    def _bare_blocking_calls(src: str) -> list[str]:
+        src = _strip_nested_def_bodies(textwrap.dedent(src))
+        offenders = []
+        for m in re.finditer(r"\b(audit|meter_record|connect)\(", src):
+            start = m.start()
+            prefix = src[max(0, start - 40):start]
+            if "run_in_threadpool" in prefix or prefix.rstrip().endswith("import"):
+                continue
+            offenders.append(src[max(0, start - 20):start + 20].replace("\n", "\\n"))
+        return offenders
+
+    for name, obj in vars(main_mod).items():
+        if inspect.iscoroutinefunction(obj):
+            offenders = _bare_blocking_calls(inspect.getsource(obj))
+            assert not offenders, f"{name} has un-threadpooled blocking call(s): {offenders}"
+
+    offenders = _bare_blocking_calls(inspect.getsource(mw_mod.PolicyMiddleware.dispatch))
+    assert not offenders, f"PolicyMiddleware.dispatch has un-threadpooled blocking call(s): {offenders}"

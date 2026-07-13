@@ -90,18 +90,30 @@ CREATE TABLE IF NOT EXISTS credential_leases (
     issued_at TEXT NOT NULL,
     expires_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS episodic_memory (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    agent TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'output',
+    content TEXT NOT NULL,
+    ts TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_episodic_task_seq ON episodic_memory(task_id, seq);
 """
 
 
 def _path(name: str) -> str:
-    os.makedirs(settings.hooks_dir, exist_ok=True)
-    return os.path.join(settings.hooks_dir, name)
+    hooks_dir = os.path.abspath(settings.hooks_dir)
+    os.makedirs(hooks_dir, exist_ok=True)
+    return os.path.join(hooks_dir, name)
 
 
 @contextmanager
 def connect(name: str):
-    conn = sqlite3.connect(_path(name))
+    conn = sqlite3.connect(_path(name), timeout=10.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000;")
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA foreign_keys=ON;")
     try:

@@ -44,3 +44,6 @@ hooks/
 .venv/
 venv/
 test_hooks/
+
+# Next.js
+.next/

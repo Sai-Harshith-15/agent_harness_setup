@@ -4,10 +4,11 @@ Locks are leased rows in control_plane.db so a crash leaves a reclaimable record
 rather than an in-memory lock that vanishes. OCC compares a caller-supplied version
 hash against the live note; a mismatch = state_changed (never a silent overwrite).
 """
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException
+from starlette.concurrency import run_in_threadpool
 
 from ..db import CONTROL_DB, connect
 
@@ -43,25 +44,29 @@ def acquire_lock(resource: str, agent: str, task_id: str) -> None:
         current_resource = _task_waiting_on.get(owner)
 
     with connect(CONTROL_DB) as c:
-        row = c.execute("SELECT agent, task_id, lease_expires_at FROM locks WHERE resource=?",
-                        (resource,)).fetchone()
-        if row:
-            expires = datetime.fromisoformat(row["lease_expires_at"])
-            held_by_other = row["task_id"] != task_id
-            if held_by_other and expires > _now():
-                _task_waiting_on[task_id] = resource
-                raise HTTPException(status_code=409,
-                                    detail=f"resource locked by {row['agent']}:{row['task_id']}")
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            row = c.execute("SELECT agent, task_id, lease_expires_at FROM locks WHERE resource=?",
+                            (resource,)).fetchone()
+            if row:
+                expires = datetime.fromisoformat(row["lease_expires_at"])
+                held_by_other = row["task_id"] != task_id
+                if held_by_other and expires > _now():
+                    _task_waiting_on[task_id] = resource
+                    raise HTTPException(status_code=409,
+                                        detail=f"resource locked by {row['agent']}:{row['task_id']}")
 
-        # Lock acquired, clear waiting state if any
-        _task_waiting_on.pop(task_id, None)
-        exp = (_now() + timedelta(seconds=LEASE_SECONDS)).isoformat()
-        c.execute(
-            "INSERT INTO locks (resource, agent, task_id, lease_expires_at) VALUES (?,?,?,?) "
-            "ON CONFLICT(resource) DO UPDATE SET agent=excluded.agent, task_id=excluded.task_id, "
-            "lease_expires_at=excluded.lease_expires_at",
-            (resource, agent, task_id, exp),
-        )
+            _task_waiting_on.pop(task_id, None)
+            exp = (_now() + timedelta(seconds=LEASE_SECONDS)).isoformat()
+            c.execute(
+                "INSERT INTO locks (resource, agent, task_id, lease_expires_at) VALUES (?,?,?,?) "
+                "ON CONFLICT(resource) DO UPDATE SET agent=excluded.agent, task_id=excluded.task_id, "
+                "lease_expires_at=excluded.lease_expires_at",
+                (resource, agent, task_id, exp),
+            )
+        except Exception:
+            c.execute("ROLLBACK")
+            raise
 
 
 def release_lock(resource: str, task_id: str, reason: str = "released") -> None:
@@ -83,3 +88,14 @@ def governed_write(resource: str, agent: str, task_id: str):
         yield
     finally:
         release_lock(resource, task_id)
+
+
+@asynccontextmanager
+async def governed_write_async(resource: str, agent: str, task_id: str):
+    """Async-safe variant of governed_write: acquire/release run off the event loop
+    so a contended lock (busy_timeout up to 5s) doesn't stall other concurrent requests."""
+    await run_in_threadpool(acquire_lock, resource, agent, task_id)
+    try:
+        yield
+    finally:
+        await run_in_threadpool(release_lock, resource, task_id)

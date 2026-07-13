@@ -1,4 +1,5 @@
 import pytest
+from conftest import make_identity
 from fastapi.testclient import TestClient
 
 from context_server.app.db import CONTROL_DB, connect
@@ -29,19 +30,22 @@ def clean_locks():
             pass
 
 
+HERMES_6 = make_identity("hermes", "task-6")
+OPENCODE_6 = make_identity("opencode", "task-6")
+CODEX_99 = make_identity("codex", "task-99")
+
+
 def test_phase6_out_of_matrix_write_denied(client):
-    # 1. Out-of-matrix write is DENIED
     res = client.post(
         "/mcp/append_implement",
         json={"path": "People/Alice.md", "target": "Notes", "content": "nope"},
-        headers={"X-Agent-Identity": "hermes:task-6:cababbc77d7b77c66d010f147df06c57ba005b403895166ba8cb3d9006f5893a"}
+        headers={"X-Agent-Identity": HERMES_6}
     )
     assert res.status_code == 403
     assert "is not an agent-writable log target" in res.json()["detail"]
 
 
 def test_phase6_allowed_write_succeeds(client, monkeypatch):
-    # Mock backend to simulate OCC pass
     import context_server.app.main as main_mod
 
     class DummyBackend:
@@ -56,43 +60,39 @@ def test_phase6_allowed_write_succeeds(client, monkeypatch):
 
     monkeypatch.setattr(main_mod, "backend", DummyBackend())
 
-    # 2. Allowed write succeeds (designated log heading)
     res = client.post(
         "/mcp/append_implement",
-        json={"path": "okf/log.md", "target": "Agent Updates", "content": "- did the thing", "expected_version": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
-        headers={"X-Agent-Identity": "opencode:task-6:9b9f441bdd1578ac0104b0589073d38a666c76130b9430f173d9b919623a8ae5"}
+        json={"path": "okf/log.md", "target": "Agent Updates", "content": "- did the thing",
+              "expected_version": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+        headers={"X-Agent-Identity": OPENCODE_6}
     )
     assert res.status_code == 200
     assert res.json()["ok"] is True
 
 
 def test_phase6_lock_contention(client):
-    # Acquire a lock manually first
     acquire_lock("okf/log.md", "hermes", "task-99")
 
-    # 3. Lock contention: two different tasks, same resource -> second gets 409
     res = client.post(
         "/mcp/append_implement",
         json={"path": "okf/log.md", "target": "Agent Updates", "content": "- did the thing"},
-        headers={"X-Agent-Identity": "opencode:task-6:9b9f441bdd1578ac0104b0589073d38a666c76130b9430f173d9b919623a8ae5"}
+        headers={"X-Agent-Identity": OPENCODE_6}
     )
     assert res.status_code == 409
     assert "resource locked by hermes:task-99" in res.json()["detail"]
 
 
 def test_phase6_hitl_pause_and_resolve(client):
-    # 4. HITL pause
     res = client.post(
         "/mcp/request_clarification",
         json={"question": "overwrite config?", "proposed_diff": {"path": "x", "before": "a", "after": "b"}},
-        headers={"X-Agent-Identity": "codex:task-99:982a73795578386cabc3eca10f1684f3218f4c5220345a09e32b9af877745c22"}
+        headers={"X-Agent-Identity": CODEX_99}
     )
     assert res.status_code == 200
     data = res.json()
     assert data["paused"] is True
     item_id = data["hitl_item"]
 
-    # Verify in dashboard
     res_dash = client.get("/dashboard/hitl")
     assert res_dash.status_code == 200
     items = res_dash.json()["open"]
@@ -100,20 +100,18 @@ def test_phase6_hitl_pause_and_resolve(client):
     assert items[0]["id"] == item_id
     assert items[0]["task_id"] == "task-99"
 
-    # Verify it is hibernated in db
     with connect(CONTROL_DB) as c:
         hib = c.execute("SELECT * FROM hibernation WHERE task_id='task-99'").fetchone()
         assert hib is not None
 
-    # Resolve it
     res_patch = client.patch(
         "/dashboard/hitl",
-        json={"item_id": item_id, "status": "approved", "resolution": "go ahead"}
+        json={"item_id": item_id, "status": "approved", "resolution": "go ahead"},
+        headers={"X-Agent-Identity": OPENCODE_6}
     )
     assert res_patch.status_code == 200
     assert res_patch.json()["status"] == "approved"
 
-    # Verify thawed (removed from hibernation)
     with connect(CONTROL_DB) as c:
         hib_after = c.execute("SELECT * FROM hibernation WHERE task_id='task-99'").fetchone()
         assert hib_after is None
@@ -159,9 +157,43 @@ def test_phase6_crash_reconciliation(client, monkeypatch):
     assert "orphan-99" in orphans
 
 
+def test_phase6_startup_reconcile_leaves_live_leases_alone():
+    """H3 regression: startup reconcile must not treat every existing lock as a crash.
+    A lock with a still-valid (non-expired) lease represents a task that may still be
+    legitimately in-flight across a restart and must be left alone."""
+    from datetime import datetime, timedelta, timezone
+
+    from context_server.app.db import init_db
+    from context_server.app.governance.reconcile import reconcile
+
+    init_db()
+
+    with connect(CONTROL_DB) as c:
+        c.execute("DELETE FROM locks")
+        live_expires = (datetime.now(timezone.utc) + timedelta(seconds=100)).isoformat()
+        c.execute(
+            "INSERT INTO locks (resource, agent, task_id, lease_expires_at) VALUES (?, ?, ?, ?)",
+            ("still/live.md", "hermes", "task-still-alive", live_expires),
+        )
+        expired_at = (datetime.now(timezone.utc) - timedelta(seconds=10)).isoformat()
+        c.execute(
+            "INSERT INTO locks (resource, agent, task_id, lease_expires_at) VALUES (?, ?, ?, ?)",
+            ("really/expired.md", "opencode", "task-really-expired", expired_at),
+        )
+
+    result = reconcile(startup=True)
+
+    crash_resources = [c["resource"] for c in result["crashes"]]
+    assert "really/expired.md" in crash_resources
+    assert "still/live.md" not in crash_resources
+
+    with connect(CONTROL_DB) as c:
+        remaining = {r["resource"] for r in c.execute("SELECT resource FROM locks").fetchall()}
+    assert "still/live.md" in remaining
+    assert "really/expired.md" not in remaining
+
+
 def test_phase6_crash_reconcile_span_and_snapshot(monkeypatch):
-    """Gap 1.1: verify startup reconciliation emits OTel span (infrastructure_crash)
-    and calls restore_snapshot for crashed locks."""
     from datetime import datetime, timedelta, timezone
     from unittest.mock import patch
 
@@ -170,7 +202,6 @@ def test_phase6_crash_reconcile_span_and_snapshot(monkeypatch):
 
     init_db()
 
-    # Insert an expired lock that simulates a crash-orphaned lease
     with connect(CONTROL_DB) as c:
         c.execute("DELETE FROM locks")
         expired_at = (datetime.now(timezone.utc) - timedelta(seconds=300)).isoformat()
@@ -179,14 +210,12 @@ def test_phase6_crash_reconcile_span_and_snapshot(monkeypatch):
             ("crash/test.md", "hermes", "task-crash-span", expired_at),
         )
 
-    # Mock restore_snapshot to verify it gets called
+    monkeypatch.setenv("CRASH_RESTORE_SNAPSHOT", "true")
     with patch("context_server.app.governance.snapshot.restore_snapshot") as mock_restore:
         result = reconcile(startup=True)
 
-    # Verify the crash was detected
     assert len(result["crashes"]) >= 1
     crash_resources = [c["resource"] for c in result["crashes"]]
     assert "crash/test.md" in crash_resources
 
-    # Verify restore_snapshot was called with the crashed task_id
     mock_restore.assert_called_with("task-crash-span")

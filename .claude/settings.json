@@ -1,0 +1,4 @@
+{
+  "enabledMcpjsonServers": ["headroom", "ponytail"],
+  "enableAllProjectMcpServers": false
+}

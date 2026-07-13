@@ -6,6 +6,7 @@ dict the /dashboard and OTel layer can report.
 import os
 import re
 
+from ..middlewares import DLPFilter
 from .store import add_edge, content_hash, init_index, needs_reindex, upsert_node
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -45,7 +46,9 @@ def graphify(root: str = ROOT) -> dict:
                 skipped += 1
                 continue
             kind = "note" if ext == ".md" else "file"
-            upsert_node(path, kind, h, _tokens(text), summary=text[:160].replace("\n", " "))
+            summary_raw = text[:160].replace("\n", " ")
+            summary = DLPFilter.scrub(summary_raw, source=path, agent="graphify", task_id="index")
+            upsert_node(path, kind, h, _tokens(text), summary=summary)
             for m in _PY_IMPORT.findall(text):
                 add_edge(path, m, "imports")
             for m in _MD_LINK.findall(text):

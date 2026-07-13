@@ -1,4 +1,5 @@
 import pytest
+from conftest import make_identity
 from fastapi.testclient import TestClient
 
 from context_server.app.main import app
@@ -11,23 +12,15 @@ def client():
 
 @pytest.fixture(autouse=True)
 def setup_data():
-    # Insert some data for analyze() to pick up
-    # 1. Drift: detect_drift reads from hooks/state.json, but it's hard to mock cleanly here without patching detect_drift.
-    # We will just patch analyze's dependencies for testing if needed, or patch the db.
     pass
 
 def test_phase8_meta_analyze(monkeypatch):
     import context_server.app.meta.dream_cycle as dream_cycle
     from context_server.app.meta.dream_cycle import analyze
 
-    # mock drift
     monkeypatch.setattr(dream_cycle, "detect_drift", lambda: [{"spec": "Spec A", "changed_code": ["file_a.py"]}])
-
-    # mock capo
     monkeypatch.setattr(dream_cycle, "capo", lambda: {"capo": 6000, "total_tokens": 6000, "accepted_tasks": 1})
     monkeypatch.setattr(dream_cycle, "totals_by_task", lambda limit=1: [{"task_id": "task-expensive", "total_tokens": 6000, "accepted": 1}])
-
-    # mock denials
     monkeypatch.setattr(dream_cycle, "_recent_denials", lambda limit=50: [{"tool": "write", "detail": "DENY", "n": 4}])
 
     proposals = analyze()
@@ -51,15 +44,16 @@ def test_phase8_endpoints(client, monkeypatch):
     assert res.status_code == 200
     assert len(res.json()["proposals"]) == 1
 
-    # Deny non-meta/non-opencode
-    res = client.post("/mcp/run_dream_cycle", headers={"X-Agent-Identity": "codex:task-1:109c953a2ab259bc26e615ab770c938885dc9561455a7926d73665d61904b0c3"})
+    codex_ident = make_identity("codex", "task-1")
+    res = client.post("/mcp/run_dream_cycle", headers={"X-Agent-Identity": codex_ident})
     assert res.status_code == 403
 
     async def mock_run_dream_cycle():
         return {"ok": True, "proposals": [{"kind": "test"}], "written_to": "okf/log.md"}
     monkeypatch.setattr(main_app, "run_dream_cycle", mock_run_dream_cycle)
 
-    res = client.post("/mcp/run_dream_cycle", headers={"X-Agent-Identity": "meta:dream-1:96be4d4d6c684ac6b0580fbb730a9e46e4e8bce2611825baa4abac4a504e45c4"})
+    meta_ident = make_identity("meta", "dream-1")
+    res = client.post("/mcp/run_dream_cycle", headers={"X-Agent-Identity": meta_ident})
     assert res.status_code == 200
     assert res.json()["ok"] is True
     assert len(res.json()["proposals"]) == 1

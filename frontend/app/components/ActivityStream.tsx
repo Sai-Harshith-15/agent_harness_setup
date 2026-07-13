@@ -1,18 +1,18 @@
 "use client";
 
 import { useEffect } from "react";
-import { Activity, Cpu } from "lucide-react";
 import { useStore } from "../../lib/store";
 
 export function ActivityStream({ initialActivity }: { initialActivity: any[] }) {
   const { logs, addLog, connectWebSockets } = useStore();
 
   useEffect(() => {
-    // initialize state
     if (logs.length === 0 && initialActivity.length > 0) {
-      initialActivity.forEach(log => addLog(log));
+      initialActivity.forEach((log) => addLog(log));
     }
-    connectWebSockets();
+    const cleanup = connectWebSockets();
+    return cleanup;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const displayLogs = logs.length > 0 ? logs : initialActivity;
@@ -20,84 +20,92 @@ export function ActivityStream({ initialActivity }: { initialActivity: any[] }) 
   const handleExportCSV = () => {
     if (displayLogs.length === 0) return;
     const header = ["Time", "Agent", "Tool", "Status", "Detail"].join(",");
-    const rows = displayLogs.map(a => {
-      return [
+    const rows = displayLogs.map((a) =>
+      [
         `"${a.ts}"`,
         `"${a.agent}"`,
         `"${a.tool}"`,
         `"${a.ok ? "Success" : "Failed"}"`,
-        `"${a.detail?.replace(/"/g, '""') || ""}"`
-      ].join(",");
-    });
+        `"${a.detail?.replace(/"/g, '""') || ""}"`,
+      ].join(",")
+    );
     const csv = [header, ...rows].join("\n");
-    const blob = new Blob([csv], { type: 'text/csv' });
+    const blob = new Blob([csv], { type: "text/csv" });
     const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
+    const a = document.createElement("a");
     a.href = url;
     a.download = `audit-log-${new Date().toISOString()}.csv`;
     a.click();
   };
 
   return (
-    <section className="glass-panel overflow-hidden h-full">
-      <div className="p-6 border-b border-white/5 bg-white/[0.02] flex justify-between items-center">
-        <h2 className="text-sm uppercase tracking-widest text-white/50 font-semibold flex items-center gap-2">
-          <Activity className="w-4 h-4" /> Activity Stream
+    <section className="glass-panel flex flex-col h-full min-h-[400px]">
+      <div className="p-4 border-b border-white/5 bg-white/[0.02] flex items-center justify-between">
+        <h2 className="text-sm uppercase tracking-widest text-white/50 font-semibold">
+          Activity Stream
         </h2>
-        <button onClick={handleExportCSV} className="text-xs bg-white/10 hover:bg-white/20 px-3 py-1 rounded transition-colors">
-          Export CSV
-        </button>
+        <div className="flex items-center gap-3">
+          <span className="text-xs text-white/30 font-mono">
+            {displayLogs.length} events
+          </span>
+          <button
+            onClick={handleExportCSV}
+            className="text-xs px-3 py-1 rounded-lg bg-white/5 border border-white/10 text-white/60 hover:text-white/90 hover:bg-white/10 transition-colors"
+          >
+            Export CSV
+          </button>
+        </div>
       </div>
-      
-      <div className="overflow-x-auto">
-        <table className="w-full text-sm text-left">
-          <thead className="text-xs uppercase text-white/30 bg-white/[0.01]">
-            <tr>
-              <th className="px-6 py-4 font-medium tracking-wider">Time</th>
-              <th className="px-6 py-4 font-medium tracking-wider">Agent</th>
-              <th className="px-6 py-4 font-medium tracking-wider">Tool</th>
-              <th className="px-6 py-4 font-medium tracking-wider">Status</th>
-              <th className="px-6 py-4 font-medium tracking-wider">Detail</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-white/5">
-            {displayLogs.map((a: any) => (
-              <tr key={a.id} className="hover:bg-white/[0.02] transition-colors">
-                <td className="px-6 py-4 whitespace-nowrap text-white/40 font-mono text-xs">{a.ts}</td>
-                <td className="px-6 py-4">
-                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-white/5 text-white/80 text-xs font-medium">
-                    <Cpu className="w-3 h-3 text-accent" /> {a.agent}
-                  </span>
-                </td>
-                <td className="px-6 py-4 text-white/70 font-medium">{a.tool}</td>
-                <td className="px-6 py-4">
-                  {a.ok ? (
-                    <span className="inline-flex items-center gap-1.5 text-success text-xs font-medium bg-success/10 px-2 py-0.5 rounded">
-                      <span className="w-1.5 h-1.5 rounded-full bg-success animate-pulse"></span> Success
-                    </span>
-                  ) : (
-                    <span className="inline-flex items-center gap-1.5 text-danger text-xs font-medium bg-danger/10 px-2 py-0.5 rounded">
-                      <span className="w-1.5 h-1.5 rounded-full bg-danger"></span> Failed
-                    </span>
-                  )}
-                </td>
-                <td className="px-6 py-4 text-white/50 max-w-xs truncate" title={a.detail}>
-                  {a.detail}
-                </td>
+      <div className="flex-1 overflow-y-auto">
+        {displayLogs.length === 0 ? (
+          <div className="flex flex-col items-center justify-center py-12 text-center">
+            <p className="text-sm text-white/40">No activity yet.</p>
+          </div>
+        ) : (
+          <table className="w-full text-sm">
+            <thead className="sticky top-0 bg-[#0a0a0a]/95 backdrop-blur-sm">
+              <tr className="text-left text-white/40 uppercase text-[11px] tracking-wider">
+                <th className="py-2 px-4 font-medium">Time</th>
+                <th className="py-2 px-4 font-medium">Agent</th>
+                <th className="py-2 px-4 font-medium">Tool</th>
+                <th className="py-2 px-4 font-medium">Status</th>
+                <th className="py-2 px-4 font-medium">Detail</th>
               </tr>
-            ))}
-            {displayLogs.length === 0 && (
-              <tr>
-                <td colSpan={5} className="px-6 py-16 text-center">
-                  <div className="flex flex-col items-center gap-2 opacity-40">
-                    <Activity className="w-8 h-8 mb-2" />
-                    <p>No activity recorded yet.</p>
-                  </div>
-                </td>
-              </tr>
-            )}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {displayLogs.map((a, i) => (
+                <tr
+                  key={a.id || i}
+                  className="border-t border-white/5 hover:bg-white/[0.02] transition-colors"
+                >
+                  <td className="py-2 px-4 font-mono text-xs text-white/50">
+                    {a.ts}
+                  </td>
+                  <td className="py-2 px-4 text-white/80 font-medium">
+                    {a.agent}
+                  </td>
+                  <td className="py-2 px-4 font-mono text-xs text-accent">
+                    {a.tool}
+                  </td>
+                  <td className="py-2 px-4">
+                    <span
+                      className={`inline-block px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider ${
+                        a.ok
+                          ? "bg-success/20 text-success"
+                          : "bg-danger/20 text-danger"
+                      }`}
+                    >
+                      {a.ok ? "OK" : "FAIL"}
+                    </span>
+                  </td>
+                  <td className="py-2 px-4 text-xs text-white/40 max-w-[200px] truncate">
+                    {a.detail || "-"}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
       </div>
     </section>
   );

@@ -105,8 +105,9 @@ class TestSecretsBridge:
 
         from context_server.app.main import app
 
+        ident = sign_identity("opencode", "task-13")
         with TestClient(app, raise_server_exceptions=False) as client:
-            res = client.get("/dashboard/secrets")
+            res = client.get("/dashboard/secrets", headers={"X-Agent-Identity": ident})
             assert res.status_code == 200
             data = res.json()
             assert "services" in data

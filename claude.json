@@ -8,5 +8,15 @@
         "allow": [],
         "deny": []
     },
-    "apiKeyHelper": "echo 'fe_oa_411a8778a11d4999f07dd2bcd26a91a07b6ab82f68ea0890'"
+    "apiKeyHelper": "echo 'fe_oa_411a8778a11d4999f07dd2bcd26a91a07b6ab82f68ea0890'",
+    "mcpServers": {
+        "headroom": {
+            "command": "headroom",
+            "args": ["proxy"]
+        },
+        "ponytail": {
+            "command": "node",
+            "args": ["D:\\usefulRepos\\ponytail\\ponytail-mcp\\index.js"]
+        }
+    }
 }
