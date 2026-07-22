@@ -12,10 +12,22 @@ export default async function Vault({
     `/dashboard/vault${path ? `?path=${encodeURIComponent(path)}` : ""}`
   );
 
+  const hasError = data.error || data.entries === null;
+  const entries: string[] = data.entries?.files || data.entries || [];
+
   return (
     <main className="p-8 md:p-12 max-w-7xl mx-auto">
       <PageHeader title="Vault" description="Read-only Obsidian browser" />
-      {data.note ? (
+      {hasError ? (
+        <DataCard title="Unavailable">
+          <div className="text-sm text-white/40 py-8 text-center space-y-2">
+            <p>{data.error || "Obsidian backend is unreachable."}</p>
+            <p className="text-xs text-white/25">
+              Check that the obsidian-local-rest-api plugin is running on port 27123.
+            </p>
+          </div>
+        </DataCard>
+      ) : data.note ? (
         <DataCard title={path}>
           <pre className="text-sm text-white/80 whitespace-pre-wrap font-mono bg-black/20 rounded-lg p-4 overflow-x-auto max-h-[70vh] overflow-y-auto">
             {data.note.content}
@@ -24,7 +36,7 @@ export default async function Vault({
       ) : (
         <DataCard title="Directory">
           <ul className="space-y-1">
-            {(data.entries || []).map((e: string) => (
+            {(entries || []).map((e: string) => (
               <li key={e}>
                 <a
                   href={`/vault?path=${encodeURIComponent(e)}`}
@@ -34,7 +46,7 @@ export default async function Vault({
                 </a>
               </li>
             ))}
-            {(data.entries || []).length === 0 && (
+            {(entries || []).length === 0 && (
               <p className="text-sm text-white/30 py-4 text-center">
                 No entries found
               </p>

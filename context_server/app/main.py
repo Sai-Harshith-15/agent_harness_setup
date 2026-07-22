@@ -8,7 +8,6 @@ from datetime import datetime, time, timedelta
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.concurrency import run_in_threadpool
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
@@ -16,6 +15,7 @@ from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 from .config import settings
 from .db import CONTROL_DB, audit, connect, init_db
@@ -164,9 +164,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Agentic OS Context Server", version="0.2.0", lifespan=lifespan)
 
-resource = Resource.create({"service.name": "context_server"})
-provider = TracerProvider(resource=resource)
-if os.environ.get("ENABLE_OTEL", "true").lower() not in ("0", "false", "no"):
+if settings.enable_otel:
+    resource = Resource.create({"service.name": "context_server"})
+    provider = TracerProvider(resource=resource)
     if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("TEST_MODE") == "true":
         from opentelemetry.sdk.trace.export import SimpleSpanProcessor, SpanExporter, SpanExportResult
         class NoOpSpanExporter(SpanExporter):
@@ -176,8 +176,8 @@ if os.environ.get("ENABLE_OTEL", "true").lower() not in ("0", "false", "no"):
     else:
         processor = BatchSpanProcessor(OTLPSpanExporter(endpoint="http://localhost:4317", insecure=True))
     provider.add_span_processor(processor)
-trace.set_tracer_provider(provider)
-FastAPIInstrumentor.instrument_app(app)
+    trace.set_tracer_provider(provider)
+    FastAPIInstrumentor.instrument_app(app)
 
 app.add_middleware(PolicyMiddleware)
 app.add_middleware(
@@ -222,7 +222,12 @@ async def dashboard_vault(path: str = ""):
             return {"path": path, "note": await backend.read_note(path)}
         return {"path": "", "entries": await backend.list_vault()}
     except Exception:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail="Obsidian backend error")
+        return {
+            "path": path,
+            "entries": None,
+            "note": None,
+            "error": "Obsidian backend unavailable — start the obsidian-local-rest-api plugin.",
+        }
 
 @app.websocket("/dashboard/events")
 async def dashboard_events(websocket: WebSocket):

@@ -75,7 +75,7 @@ export function ActivityStream({ initialActivity }: { initialActivity: any[] }) 
             <tbody>
               {displayLogs.map((a, i) => (
                 <tr
-                  key={a.id || i}
+                  key={`${a.id}_${i}`}
                   className="border-t border-white/5 hover:bg-white/[0.02] transition-colors"
                 >
                   <td className="py-2 px-4 font-mono text-xs text-white/50">
